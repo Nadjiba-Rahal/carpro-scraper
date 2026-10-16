@@ -25,7 +25,7 @@ def get_driver():
     options.add_argument("--window-size=1920,1080")
     # ⚠️ PAS de --headless : on utilise xvfb (écran virtuel) à la place
 
-    driver = uc.Chrome(options=options, version_main=141)
+    driver = uc.Chrome(options=options)
     return driver
 
 
