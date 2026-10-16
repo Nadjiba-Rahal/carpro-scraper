@@ -15,7 +15,7 @@ ALCOPA_URLS = [
 ]
 
 
-async def scrape_alcopa(url: str) -> list[dict]:
+async def scrape_alcopa(url: str) -> list:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -36,30 +36,28 @@ async def scrape_alcopa(url: str) -> list[dict]:
             timezone_id="Europe/Paris",
         )
         page = await context.new_page()
+
         stealth = Stealth()
         await stealth.apply_stealth_async(page)
 
         print(f"Chargement : {url}")
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
 
-        # Attendre que le contenu se charge
-        await asyncio.sleep(8)
+        await asyncio.sleep(10)
 
         html = await page.content()
         await browser.close()
 
-        print(f"HTML récupéré : {len(html)} caractères")
+        print(f"HTML recupere : {len(html)} caracteres")
 
         match = re.search(
             r"window\.Alcopa\.searchResultsJSONString\s*=\s*'(.*?)';",
             html,
             re.DOTALL
         )
+
         if not match:
-            print("JSON non trouvé")
-            # Sauvegarde le HTML pour debug
-            with open("debug.html", "w", encoding="utf-8") as f:
-                f.write(html)
+            print("JSON non trouve")
             return []
 
         data = json.loads(json.loads(f'"{match.group(1)}"'))
@@ -67,8 +65,45 @@ async def scrape_alcopa(url: str) -> list[dict]:
 
 
 async def main():
+    all_vehicles = []
+
     for url in ALCOPA_URLS:
-        await diagnostic(url)
+        try:
+            vehicles = await scrape_alcopa(url)
+            all_vehicles.extend(vehicles)
+            print(f"{len(vehicles)} vehicules extraits de {url}")
+        except Exception as e:
+            print(f"Erreur sur {url}: {e}")
+        await asyncio.sleep(2)
+
+    print(f"Total : {len(all_vehicles)} vehicules")
+
+    if not all_vehicles:
+        print("Aucun vehicule, arret.")
+        sys.exit(0)
+
+    payload = {
+        "source": "Alcopa Auction",
+        "total": len(all_vehicles),
+        "vehicules": all_vehicles,
+    }
+
+    print("Envoi a WordPress...")
+    response = requests.post(
+        WP_URL,
+        json=payload,
+        headers={
+            "Authorization": f"Bearer {WP_KEY}",
+            "Content-Type": "application/json",
+        },
+        timeout=120,
+    )
+
+    if response.status_code == 200:
+        print(f"WordPress : {response.json()}")
+    else:
+        print(f"Erreur WordPress ({response.status_code}) : {response.text}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
