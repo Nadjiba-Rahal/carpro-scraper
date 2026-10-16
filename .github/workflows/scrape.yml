@@ -8,7 +8,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
@@ -19,10 +19,15 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Installer Chrome
+        uses: browser-actions/setup-chrome@v1
+        with:
+          chrome-version: stable
+
       - name: Installer les dépendances
         run: |
           pip install --upgrade pip
-          pip install curl_cffi beautifulsoup4
+          pip install selenium beautifulsoup4 requests
 
       - name: Lancer le scraper
         env:
