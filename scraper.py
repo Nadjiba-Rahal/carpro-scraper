@@ -36,7 +36,8 @@ async def scrape_alcopa(url: str) -> list[dict]:
             timezone_id="Europe/Paris",
         )
         page = await context.new_page()
-        await stealth_async(page)
+        stealth = Stealth()
+        await stealth.apply_stealth_async(page)
 
         print(f"Chargement : {url}")
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
