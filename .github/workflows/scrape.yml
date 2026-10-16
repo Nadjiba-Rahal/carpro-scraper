@@ -1,0 +1,35 @@
+name: CarPro — Import Alcopa
+
+on:
+  # Toutes les heures (à la minute 0)
+  schedule:
+    - cron: '0 * * * *'
+
+  # Permet de lancer manuellement depuis l'interface GitHub
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout du repo
+        uses: actions/checkout@v4
+
+      - name: Installer Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Installer les dépendances
+        run: |
+          pip install --upgrade pip
+          pip install playwright requests
+          python -m playwright install --with-deps chromium
+
+      - name: Lancer le scraper
+        env:
+          WP_URL: ${{ secrets.WP_URL }}
+          WP_API_KEY: ${{ secrets.WP_API_KEY }}
+        run: python scraper.py
