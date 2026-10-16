@@ -2,7 +2,6 @@ name: CarPro Import Alcopa
 
 on:
   schedule:
-    # 2 fois par jour : 6h et 18h UTC (8h et 20h heure d'Alger)
     - cron: '0 6,18 * * *'
   workflow_dispatch:
 
@@ -23,11 +22,18 @@ jobs:
       - name: Installer les dépendances
         run: |
           pip install --upgrade pip
-          pip install requests beautifulsoup4
+          pip install curl_cffi beautifulsoup4
 
       - name: Lancer le scraper
         env:
           WP_URL: ${{ secrets.WP_URL }}
           WP_API_KEY: ${{ secrets.WP_API_KEY }}
-          SCRAPINGANT_KEY: ${{ secrets.SCRAPINGANT_KEY }}
         run: python scraper.py
+
+      - name: Upload debug HTML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-html
+          path: debug_home.html
+          if-no-files-found: ignore
