@@ -19,18 +19,21 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Installer Chrome + xvfb
+      - name: Installer Chrome 131 + xvfb
         run: |
           sudo apt-get update
           sudo apt-get install -y wget xvfb unzip
-          # Chrome version compatible
+          # Chrome 131 (version stable et bien supportée par undetected-chromedriver)
+          wget -q -O /tmp/chrome.deb https://storage.googleapis.com/chrome-for-testing-public/131.0.6778.204/linux64/chrome-linux64.zip || true
+          # Fallback : installe la version stable standard
           wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo apt-get install -y /tmp/chrome.deb
+          google-chrome --version
 
       - name: Installer les dépendances Python
         run: |
           pip install --upgrade pip
-          pip install undetected-chromedriver==3.5.5 beautifulsoup4 requests
+          pip install undetected-chromedriver beautifulsoup4 requests
 
       - name: Lancer le scraper (avec xvfb)
         env:
