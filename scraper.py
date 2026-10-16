@@ -1,90 +1,183 @@
-import asyncio
 import json
 import os
 import re
 import sys
+import time
 import requests
-from playwright.async_api import async_playwright
-from playwright_stealth import Stealth
+from bs4 import BeautifulSoup
 
+# ============================================
+# CONFIGURATION
+# ============================================
 WP_URL = os.environ["WP_URL"]
 WP_KEY = os.environ["WP_API_KEY"]
+SCRAPINGANT_KEY = os.environ["SCRAPINGANT_KEY"]
 
-# Plusieurs URLs à tester
-TEST_URLS = [
-    "https://www.alcopa-auction.fr/calendrier-des-ventes",
-    "https://www.alcopa-auction.fr/",
-    "https://www.alcopa-auction.fr/salle-de-vente-encheres/nancy/2110",
-]
+ALCOPA_HOME = "https://www.alcopa-auction.fr/"
+
+# Nombre max de ventes à traiter par run (pour économiser le quota)
+MAX_SALES_PER_RUN = 10
 
 
-async def test_url(url: str):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ]
+def fetch_via_scrapingant(url: str) -> str:
+    """Récupère le HTML via ScrapingAnt (contourne AWS WAF)."""
+    print(f"📥 Fetch : {url}")
+
+    try:
+        response = requests.get(
+            "https://api.scrapingant.com/v2/general",
+            params={
+                "url": url,
+                "x-api-key": SCRAPINGANT_KEY,
+                "browser": "true",
+                "proxy_country": "fr",
+            },
+            timeout=90,
         )
-        context = await browser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            locale="fr-FR",
-            timezone_id="Europe/Paris",
-        )
-        page = await context.new_page()
-        stealth = Stealth()
-        await stealth.apply_stealth_async(page)
+    except Exception as e:
+        print(f"   ❌ Erreur réseau : {e}")
+        return ""
 
-        print(f"\n{'='*60}")
-        print(f"URL : {url}")
-        print(f"{'='*60}")
+    if response.status_code == 200:
+        html = response.text
+        print(f"   ✅ {len(html)} caractères reçus")
+        return html
+    else:
+        print(f"   ❌ HTTP {response.status_code} : {response.text[:200]}")
+        return ""
 
+
+def extract_sale_urls(html: str) -> list:
+    """Extrait les URLs des ventes actives depuis la page d'accueil."""
+    soup = BeautifulSoup(html, "html.parser")
+    sale_urls = set()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/salle-de-vente-encheres/" in href:
+            if href.startswith("/"):
+                href = "https://www.alcopa-auction.fr" + href
+            # Évite les doublons en retirant les query params
+            clean = href.split("?")[0].split("#")[0]
+            sale_urls.add(clean)
+
+    return sorted(sale_urls)
+
+
+def extract_vehicles_from_sale(html: str) -> list:
+    """Extrait les véhicules depuis une page de vente Alcopa."""
+    if not html:
+        return []
+
+    # Méthode 1 : variable JSON Alcopa
+    match = re.search(
+        r"window\.Alcopa\.searchResultsJSONString\s*=\s*'(.*?)';",
+        html,
+        re.DOTALL,
+    )
+    if match:
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await asyncio.sleep(8)
-            html = await page.content()
-            print(f"📏 Taille HTML : {len(html)} caractères")
-
-            # Cherche des indices de contenu réel
-            if len(html) > 50000:
-                print("✅ CONTENU RÉEL CHARGÉ")
-
-                # Essaie d'extraire les liens de ventes
-                links = re.findall(r'href="(/salle-de-vente-encheres/[^"]+)"', html)
-                unique_links = sorted(set(links))
-                print(f"🔗 {len(unique_links)} liens de ventes trouvés :")
-                for l in unique_links[:15]:
-                    print(f"   https://www.alcopa-auction.fr{l}")
-
-                # Cherche la variable JSON
-                if "searchResultsJSONString" in html:
-                    print("✅ Variable JSON présente")
-                else:
-                    print("❌ Variable JSON absente")
-            else:
-                print("❌ CONTENU BLOQUÉ PAR WAF")
-                # Cherche un indice du WAF
-                if "awsWaf" in html or "gokuProps" in html:
-                    print("🛡️ AWS WAF détecté")
-
+            raw = match.group(1)
+            data = json.loads(json.loads(f'"{raw}"'))
+            vehicles = data.get("car", [])
+            if vehicles:
+                print(f"   ✅ {len(vehicles)} véhicules (JSON)")
+                return vehicles
         except Exception as e:
-            print(f"❌ Erreur : {e}")
+            print(f"   ⚠️ Erreur parsing JSON : {e}")
 
-        await browser.close()
+    # Méthode 2 : cherche un JSON embarqué dans une balise script
+    scripts = re.findall(r"<script[^>]*>(.*?)</script>", html, re.DOTALL)
+    for s in scripts:
+        if '"car"' in s and '"brand"' in s and len(s) > 5000:
+            try:
+                # Trouve le premier { ... dernier }
+                start = s.find("{")
+                end = s.rfind("}")
+                if start >= 0 and end > start:
+                    data = json.loads(s[start : end + 1])
+                    vehicles = data.get("car", [])
+                    if vehicles:
+                        print(f"   ✅ {len(vehicles)} véhicules (script embarqué)")
+                        return vehicles
+            except Exception:
+                continue
+
+    print("   ⚠️ Aucun véhicule trouvé sur cette page")
+    return []
 
 
-async def main():
-    for url in TEST_URLS:
-        await test_url(url)
-        await asyncio.sleep(3)
+def main():
+    all_vehicles = []
+
+    # 1. Page d'accueil pour trouver les ventes actives
+    home_html = fetch_via_scrapingant(ALCOPA_HOME)
+    if not home_html:
+        print("❌ Impossible de charger la home Alcopa")
+        sys.exit(1)
+
+    sale_urls = extract_sale_urls(home_html)
+    print(f"\n🎯 {len(sale_urls)} ventes trouvées")
+
+    if not sale_urls:
+        print("⚠️ Aucune vente dans le HTML — structure à vérifier")
+        # Debug : sauvegarde le HTML
+        with open("debug_home.html", "w", encoding="utf-8") as f:
+            f.write(home_html)
+        sys.exit(0)
+
+    # Limite pour économiser le quota
+    sales_to_process = sale_urls[:MAX_SALES_PER_RUN]
+    print(f"📋 Traitement de {len(sales_to_process)} ventes\n")
+
+    for i, sale_url in enumerate(sales_to_process, 1):
+        print(f"--- [{i}/{len(sales_to_process)}] {sale_url} ---")
+        sale_html = fetch_via_scrapingant(sale_url)
+        if not sale_html:
+            continue
+
+        vehicles = extract_vehicles_from_sale(sale_html)
+        for v in vehicles:
+            v["_sale_url"] = sale_url
+        all_vehicles.extend(vehicles)
+
+        # Petit délai pour ne pas spammer
+        time.sleep(1)
+
+    print(f"\n📦 Total : {len(all_vehicles)} véhicules")
+
+    if not all_vehicles:
+        print("⚠️ Aucun véhicule, arrêt.")
+        sys.exit(0)
+
+    # 2. Envoi à WordPress
+    payload = {
+        "source": "Alcopa Auction",
+        "total": len(all_vehicles),
+        "vehicules": all_vehicles,
+    }
+
+    print("📤 Envoi à WordPress...")
+    try:
+        response = requests.post(
+            WP_URL,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {WP_KEY}",
+                "Content-Type": "application/json",
+            },
+            timeout=120,
+        )
+    except Exception as e:
+        print(f"❌ Erreur réseau WordPress : {e}")
+        sys.exit(1)
+
+    if response.status_code == 200:
+        print(f"✅ WordPress : {response.json()}")
+    else:
+        print(f"❌ Erreur WordPress ({response.status_code}) : {response.text}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
