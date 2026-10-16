@@ -10,12 +10,15 @@ from playwright_stealth import Stealth
 WP_URL = os.environ["WP_URL"]
 WP_KEY = os.environ["WP_API_KEY"]
 
-ALCOPA_URLS = [
+# Plusieurs URLs à tester
+TEST_URLS = [
+    "https://www.alcopa-auction.fr/calendrier-des-ventes",
+    "https://www.alcopa-auction.fr/",
     "https://www.alcopa-auction.fr/salle-de-vente-encheres/nancy/2110",
 ]
 
 
-async def scrape_alcopa(url: str) -> list:
+async def test_url(url: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -36,74 +39,51 @@ async def scrape_alcopa(url: str) -> list:
             timezone_id="Europe/Paris",
         )
         page = await context.new_page()
-
         stealth = Stealth()
         await stealth.apply_stealth_async(page)
 
-        print(f"Chargement : {url}")
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        print(f"\n{'='*60}")
+        print(f"URL : {url}")
+        print(f"{'='*60}")
 
-        await asyncio.sleep(10)
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            await asyncio.sleep(8)
+            html = await page.content()
+            print(f"📏 Taille HTML : {len(html)} caractères")
 
-        html = await page.content()
+            # Cherche des indices de contenu réel
+            if len(html) > 50000:
+                print("✅ CONTENU RÉEL CHARGÉ")
+
+                # Essaie d'extraire les liens de ventes
+                links = re.findall(r'href="(/salle-de-vente-encheres/[^"]+)"', html)
+                unique_links = sorted(set(links))
+                print(f"🔗 {len(unique_links)} liens de ventes trouvés :")
+                for l in unique_links[:15]:
+                    print(f"   https://www.alcopa-auction.fr{l}")
+
+                # Cherche la variable JSON
+                if "searchResultsJSONString" in html:
+                    print("✅ Variable JSON présente")
+                else:
+                    print("❌ Variable JSON absente")
+            else:
+                print("❌ CONTENU BLOQUÉ PAR WAF")
+                # Cherche un indice du WAF
+                if "awsWaf" in html or "gokuProps" in html:
+                    print("🛡️ AWS WAF détecté")
+
+        except Exception as e:
+            print(f"❌ Erreur : {e}")
+
         await browser.close()
-
-        print(f"HTML recupere : {len(html)} caracteres")
-
-        match = re.search(
-            r"window\.Alcopa\.searchResultsJSONString\s*=\s*'(.*?)';",
-            html,
-            re.DOTALL
-        )
-
-        if not match:
-            print("JSON non trouve")
-            return []
-
-        data = json.loads(json.loads(f'"{match.group(1)}"'))
-        return data.get("car", [])
 
 
 async def main():
-    all_vehicles = []
-
-    for url in ALCOPA_URLS:
-        try:
-            vehicles = await scrape_alcopa(url)
-            all_vehicles.extend(vehicles)
-            print(f"{len(vehicles)} vehicules extraits de {url}")
-        except Exception as e:
-            print(f"Erreur sur {url}: {e}")
-        await asyncio.sleep(2)
-
-    print(f"Total : {len(all_vehicles)} vehicules")
-
-    if not all_vehicles:
-        print("Aucun vehicule, arret.")
-        sys.exit(0)
-
-    payload = {
-        "source": "Alcopa Auction",
-        "total": len(all_vehicles),
-        "vehicules": all_vehicles,
-    }
-
-    print("Envoi a WordPress...")
-    response = requests.post(
-        WP_URL,
-        json=payload,
-        headers={
-            "Authorization": f"Bearer {WP_KEY}",
-            "Content-Type": "application/json",
-        },
-        timeout=120,
-    )
-
-    if response.status_code == 200:
-        print(f"WordPress : {response.json()}")
-    else:
-        print(f"Erreur WordPress ({response.status_code}) : {response.text}")
-        sys.exit(1)
+    for url in TEST_URLS:
+        await test_url(url)
+        await asyncio.sleep(3)
 
 
 if __name__ == "__main__":
