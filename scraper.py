@@ -7,10 +7,6 @@ import requests
 from playwright.async_api import async_playwright
 from playwright_stealth import Stealth
 
-WP_URL = os.environ["WP_URL"]
-WP_KEY = os.environ["WP_API_KEY"]
-
-# URL de la liste des ventes actives VPauto
 VPAUTO_URL = "https://www.vpauto.fr/vehicule/liste?event=43301"
 
 
@@ -18,82 +14,75 @@ async def diagnostic():
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ]
+            args=["--disable-blink-features=AutomationControlled",
+                  "--no-sandbox", "--disable-dev-shm-usage"]
         )
         context = await browser.new_context(
             viewport={"width": 1920, "height": 1080},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            locale="fr-FR",
-            timezone_id="Europe/Paris",
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"),
+            locale="fr-FR", timezone_id="Europe/Paris",
         )
         page = await context.new_page()
-
         stealth = Stealth()
         await stealth.apply_stealth_async(page)
 
         print(f"📥 Chargement : {VPAUTO_URL}")
         await page.goto(VPAUTO_URL, wait_until="domcontentloaded", timeout=60000)
-
-        # Attend que le contenu dynamique se charge
-        await asyncio.sleep(10)
+        await asyncio.sleep(8)
 
         html = await page.content()
         await browser.close()
 
-        print(f"📏 Taille HTML : {len(html)} caractères")
+        print(f"📏 Taille : {len(html)} caractères\n")
 
-        # Sauvegarde pour analyse
-        with open("debug_vpauto.html", "w", encoding="utf-8") as f:
-            f.write(html)
+        # 1. Cherche les liens vers les détails de véhicules
+        print("=== LIENS VÉHICULES ===")
+        links = re.findall(r'href="(/[^"]*vehicule[^"]*)"', html)
+        unique_links = sorted(set(links))
+        print(f"Trouvé {len(unique_links)} liens uniques :")
+        for l in unique_links[:10]:
+            print(f"  {l}")
 
-        # Cherche des indices de contenu
-        print("\n=== Recherche de mots-clés ===")
-        for keyword in ["mise à prix", "Mise à prix", "TAVASCAN", "CUPRA", "vehicule", "card", "annonce", "lot"]:
-            count = html.lower().count(keyword.lower())
-            if count > 0:
-                print(f"  ✅ '{keyword}' : {count} occurrences")
+        # 2. Cherche la structure autour d'une "Mise à prix"
+        print("\n=== CONTEXTE AUTOUR D'UNE 'MISE À PRIX' ===")
+        idx = html.find("Mise à prix")
+        if idx > 0:
+            start = max(0, idx - 2500)
+            end = min(len(html), idx + 1000)
+            extract = html[start:end]
+            print(f"Extrait ({len(extract)} car.) :\n")
+            print(extract)
+            with open("debug_extract.html", "w", encoding="utf-8") as f:
+                f.write(extract)
 
-        # Cherche les variables JSON ou objets JavaScript
-        print("\n=== Variables window.* détectées ===")
-        matches = re.findall(r'window\.([A-Za-z0-9_.]+)\s*=', html)
-        for v in sorted(set(matches))[:40]:
-            print(f"  window.{v}")
+        # 3. Cherche les balises <article>
+        print("\n\n=== BALISES ARTICLE/CARD ===")
+        articles = re.findall(r'<(article|div)[^>]*class="([^"]*(?:card|vehicule|vehicle|lot|annonce)[^"]*)"', html, re.IGNORECASE)
+        for tag, cls in articles[:10]:
+            print(f"  <{tag} class=\"{cls}\">")
 
-        # Cherche des scripts contenant des données
-        print("\n=== Scripts volumineux ===")
-        scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
-        for i, s in enumerate(scripts):
-            if len(s) > 3000:
-                print(f"  [Script {i}] taille={len(s)}")
-                print(f"    Début: {s[:200].strip()}")
+        # 4. Cherche les images de véhicules
+        print("\n=== IMAGES VÉHICULES ===")
+        imgs = re.findall(r'<img[^>]*src="(https?://[^"]*)"[^>]*>', html)
+        vp_imgs = [i for i in imgs if 'vpauto' in i or 'cloudinary' in i or 'vehicle' in i.lower()]
+        print(f"Trouvé {len(vp_imgs)} images :")
+        for i in vp_imgs[:5]:
+            print(f"  {i}")
 
-        # Cherche la structure des cartes véhicules
-        print("\n=== Structure HTML des véhicules ===")
-        # Essaie différents sélecteurs
-        for selector in [
-            "article", "[class*='vehicule']", "[class*='card']",
-            "[class*='annonce']", "[class*='lot']", "[class*='vehicle']",
-            "li[class*='item']", "div[class*='item']"
-        ]:
-            try:
-                elements = await page.query_selector_all(selector) if False else []
-            except:
-                elements = []
-        # Note : page est fermé, on cherche dans le HTML
-        for sel in ["article", "vehicule", "card", "annonce", "lot"]:
-            count = html.count(f'class="{sel}') + html.count(f"class='{sel}")
-            if count > 0:
-                print(f"  class*='{sel}' : ~{count} occurrences")
+        # 5. Cherche des appels API dans le code source
+        print("\n=== APPELS API POSSIBLES ===")
+        api_matches = re.findall(r'["\'](/api/[^"\']+|https?://[^"\']*api[^"\']*)["\']', html)
+        for api in sorted(set(api_matches))[:15]:
+            print(f"  {api}")
 
-        print("\n✅ Diagnostic terminé. Fichier debug_vpauto.html sauvegardé.")
+        # 6. Cherche les balises <a> avec des liens de véhicules
+        print("\n=== EXEMPLES DE LIENS DÉTAIL ===")
+        detail_links = re.findall(r'<a[^>]*href="([^"]*)"[^>]*>([^<]{0,80})</a>', html)
+        for href, text in detail_links[:20]:
+            if 'vehicule' in href.lower() or 'lot' in href.lower() or 'detail' in href.lower():
+                print(f"  {href}  →  {text.strip()}")
 
 
 if __name__ == "__main__":
