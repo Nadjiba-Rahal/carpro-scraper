@@ -5,7 +5,7 @@ import re
 import sys
 import requests
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_async
+from playwright_stealth import Stealth
 
 WP_URL = os.environ["WP_URL"]
 WP_KEY = os.environ["WP_API_KEY"]
