@@ -1,4 +1,4 @@
-name: CarPro Import Alcopa
+name: CarPro Import VPauto
 
 on:
   schedule:
@@ -19,33 +19,22 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Installer Chrome 131 + xvfb
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget xvfb unzip
-          # Chrome 131 (version stable et bien supportée par undetected-chromedriver)
-          wget -q -O /tmp/chrome.deb https://storage.googleapis.com/chrome-for-testing-public/131.0.6778.204/linux64/chrome-linux64.zip || true
-          # Fallback : installe la version stable standard
-          wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-          sudo apt-get install -y /tmp/chrome.deb
-          google-chrome --version
-
-      - name: Installer les dépendances Python
+      - name: Installer les dépendances
         run: |
           pip install --upgrade pip
-          pip install undetected-chromedriver beautifulsoup4 requests
+          pip install playwright playwright-stealth requests beautifulsoup4
+          python -m playwright install --with-deps chromium
 
-      - name: Lancer le scraper (avec xvfb)
+      - name: Lancer le diagnostic
         env:
           WP_URL: ${{ secrets.WP_URL }}
           WP_API_KEY: ${{ secrets.WP_API_KEY }}
-        run: |
-          xvfb-run -a --server-args="-screen 0 1920x1080x24" python scraper.py
+        run: python scraper.py
 
       - name: Upload debug HTML
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: debug-html
-          path: debug_home.html
+          path: debug_vpauto.html
           if-no-files-found: ignore
