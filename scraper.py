@@ -4,12 +4,8 @@ import re
 import sys
 import time
 import requests
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+import undetected_chromedriver as uc
+from bs4 import BeautifulSoup
 
 # ============================================
 # CONFIGURATION
@@ -18,44 +14,30 @@ WP_URL = os.environ["WP_URL"]
 WP_KEY = os.environ["WP_API_KEY"]
 
 ALCOPA_HOME = "https://www.alcopa-auction.fr/"
-MAX_SALES_PER_RUN = 10
+MAX_SALES_PER_RUN = 5  # Réduit pour tester plus vite
 
 
 def get_driver():
-    """Crée un navigateur Chrome headless avec des options furtives."""
-    options = Options()
-    options.add_argument("--headless=new")
+    """Crée un Chrome non-détectable via undetected-chromedriver."""
+    options = uc.ChromeOptions()
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--window-size=1920,1080")
-    options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
-    # Désactive les indicateurs d'automatisation
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
+    # ⚠️ PAS de --headless : on utilise xvfb (écran virtuel) à la place
 
-    driver = webdriver.Chrome(options=options)
-    driver.execute_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-    )
+    driver = uc.Chrome(options=options, version_main=141)
     return driver
 
 
 def fetch_page(driver, url: str) -> str:
-    """Charge une page avec Selenium et retourne le HTML."""
+    """Charge une page et attend le contenu."""
     print(f"📥 Fetch : {url}")
     try:
         driver.get(url)
-        # Attend que le contenu soit chargé (max 30s)
-        WebDriverWait(driver, 30).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-        time.sleep(3)  # Laisse le temps au JS de s'exécuter
+        # Attend que le DOM soit prêt
+        time.sleep(6)  # Le temps que le WAF résolve son challenge JS
         html = driver.page_source
-        print(f"   ✅ {len(html)} caractères reçus")
+        print(f"   ✅ {len(html)} caractères")
         return html
     except Exception as e:
         print(f"   ❌ Erreur : {e}")
@@ -63,11 +45,8 @@ def fetch_page(driver, url: str) -> str:
 
 
 def extract_sale_urls(html: str) -> list:
-    """Extrait les URLs des ventes actives depuis la page d'accueil."""
-    from bs4 import BeautifulSoup
     soup = BeautifulSoup(html, "html.parser")
     sale_urls = set()
-
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if "/salle-de-vente-encheres/" in href:
@@ -75,16 +54,14 @@ def extract_sale_urls(html: str) -> list:
                 href = "https://www.alcopa-auction.fr" + href
             clean = href.split("?")[0].split("#")[0]
             sale_urls.add(clean)
-
     return sorted(sale_urls)
 
 
 def extract_vehicles(html: str) -> list:
-    """Extrait les véhicules depuis la page (JSON Alcopa)."""
     if not html:
         return []
 
-    # Variable JSON officielle d'Alcopa
+    # Variable JSON Alcopa
     match = re.search(
         r"window\.Alcopa\.searchResultsJSONString\s*=\s*'(.*?)';",
         html,
@@ -96,44 +73,34 @@ def extract_vehicles(html: str) -> list:
             data = json.loads(json.loads(f'"{raw}"'))
             vehicles = data.get("car", [])
             if vehicles:
-                print(f"   ✅ {len(vehicles)} véhicules (JSON direct)")
+                print(f"   ✅ {len(vehicles)} véhicules (JSON)")
                 return vehicles
         except Exception as e:
-            print(f"   ⚠️ Parsing JSON : {e}")
+            print(f"   ⚠️ JSON parsing : {e}")
 
-    # Fallback : cherche un script contenant les données
-    scripts = re.findall(r"<script[^>]*>(.*?)</script>", html, re.DOTALL)
-    for s in scripts:
-        if '"car"' in s and '"brand"' in s and len(s) > 5000:
-            try:
-                start = s.find("{")
-                end = s.rfind("}")
-                if start >= 0 and end > start:
-                    data = json.loads(s[start : end + 1])
-                    vehicles = data.get("car", [])
-                    if vehicles:
-                        print(f"   ✅ {len(vehicles)} véhicules (script embarqué)")
-                        return vehicles
-            except Exception:
-                continue
-
-    print("   ⚠️ Aucun véhicule trouvé")
+    print("   ⚠️ Aucun véhicule")
     return []
 
 
 def main():
     driver = get_driver()
-
     try:
-        # 1. Page d'accueil pour trouver les ventes
+        # 1. Home
         home_html = fetch_page(driver, ALCOPA_HOME)
         if not home_html:
             print("❌ Home inaccessible")
             sys.exit(1)
 
-        # Debug
+        # Debug : sauvegarde HTML
         with open("debug_home.html", "w", encoding="utf-8") as f:
             f.write(home_html)
+
+        # Diagnostic : est-ce le vrai contenu ?
+        if len(home_html) < 50000:
+            print(f"⚠️ HTML trop petit ({len(home_html)}) — WAF probable")
+            print("   Extrait du HTML :")
+            print(home_html[:1500])
+            sys.exit(1)
 
         sale_urls = extract_sale_urls(home_html)
         print(f"\n🎯 {len(sale_urls)} ventes trouvées")
@@ -148,13 +115,11 @@ def main():
             html = fetch_page(driver, sale_url)
             if not html:
                 continue
-
             vehicles = extract_vehicles(html)
             for v in vehicles:
                 v["_sale_url"] = sale_url
             all_vehicles.extend(vehicles)
-
-            time.sleep(2)
+            time.sleep(3)
 
         print(f"\n📦 Total : {len(all_vehicles)} véhicules")
 
@@ -162,7 +127,7 @@ def main():
             print("⚠️ Aucun véhicule, arrêt.")
             sys.exit(0)
 
-        # 2. Envoi à WordPress
+        # 2. Envoi WordPress
         payload = {
             "source": "Alcopa Auction",
             "total": len(all_vehicles),
