@@ -3,24 +3,14 @@ import json
 import os
 import re
 import sys
-import requests
 from playwright.async_api import async_playwright
-
-# ============================================
-# CONFIGURATION via variables d'environnement
-# (stockées dans GitHub Secrets, pas dans le code)
-# ============================================
-WP_URL = os.environ["WP_URL"]           # ex: https://carpro-services.com/wp-json/carpro/v1/import
-WP_KEY = os.environ["WP_API_KEY"]       # clé secrète partagée
 
 ALCOPA_URLS = [
     "https://www.alcopa-auction.fr/salle-de-vente-encheres/nancy/2110",
-    # Ajoute d'autres ventes ici
 ]
 
 
-async def scrape_alcopa(url: str) -> list[dict]:
-    """Scrappe une page de vente Alcopa et retourne les véhicules."""
+async def diagnostic(url: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
@@ -32,65 +22,56 @@ async def scrape_alcopa(url: str) -> list[dict]:
             )
         })
 
-        print(f"🌐 Chargement : {url}")
+        print(f"=== Chargement : {url} ===")
         await page.goto(url, wait_until="networkidle", timeout=60000)
+
+        # Attendre encore un peu
+        await asyncio.sleep(3)
+
         html = await page.content()
         await browser.close()
 
-        match = re.search(
-            r"window\.Alcopa\.searchResultsJSONString\s*=\s*'(.*?)';",
-            html,
-            re.DOTALL
-        )
-        if not match:
-            print("❌ JSON non trouvé")
-            return []
+        print(f"\n=== Taille du HTML : {len(html)} caractères ===\n")
 
-        data = json.loads(json.loads(f'"{match.group(1)}"'))
-        return data.get("car", [])
+        # 1. Chercher toutes les variables "window.*" qui contiennent "search" ou "vehicle" ou "car"
+        print("=== Variables window.* détectées ===")
+        matches = re.findall(r'window\.([A-Za-z0-9_.]+)\s*=\s*', html)
+        unique_vars = sorted(set(matches))
+        for v in unique_vars[:80]:  # limite à 80
+            print(f"  window.{v}")
+
+        # 2. Chercher toutes les balises <script> qui contiennent des données JSON massives
+        print("\n=== Scripts contenant des données volumineuses (>5000 caractères) ===")
+        scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
+        for i, s in enumerate(scripts):
+            if len(s) > 5000:
+                # Cherche des indices
+                preview = s[:300].replace('\n', ' ').replace('\r', '')
+                print(f"\n  [Script {i}] taille={len(s)}")
+                print(f"    Début: {preview}")
+
+        # 3. Chercher "JSON.parse" ou des objets JSON massifs
+        print("\n=== Occurrences de 'JSON.parse' ===")
+        jsonparse = re.findall(r'JSON\.parse\((.{0,200}?)\)', html)
+        for i, m in enumerate(jsonparse[:10]):
+            print(f"  [{i}] {m[:150]}")
+
+        # 4. Chercher des clés spécifiques véhicule
+        print("\n=== Recherche de mots-clés ===")
+        for keyword in ["detailed_model", "first_registration", "mileage", "Alcopa", "searchResults", "offers", "vehicles"]:
+            count = html.count(keyword)
+            print(f"  '{keyword}' : {count} occurrences")
+
+        # 5. Chercher des appels API dans le HTML
+        print("\n=== URLs d'API détectées dans le HTML ===")
+        api_urls = re.findall(r'["\'](/api/[^"\']+|https?://[^"\']*api[^"\']*)["\']', html)
+        for u in sorted(set(api_urls))[:20]:
+            print(f"  {u}")
 
 
 async def main():
-    all_vehicles = []
-
     for url in ALCOPA_URLS:
-        try:
-            vehicles = await scrape_alcopa(url)
-            all_vehicles.extend(vehicles)
-            print(f"✅ {len(vehicles)} véhicules extraits de {url}")
-        except Exception as e:
-            print(f"❌ Erreur sur {url}: {e}")
-        await asyncio.sleep(2)
-
-    print(f"📦 Total : {len(all_vehicles)} véhicules")
-
-    if not all_vehicles:
-        print("⚠️ Aucun véhicule, arrêt.")
-        sys.exit(0)
-
-    # Envoi à WordPress
-    payload = {
-        "source": "Alcopa Auction",
-        "total": len(all_vehicles),
-        "vehicules": all_vehicles,
-    }
-
-    print(f"📤 Envoi à WordPress...")
-    response = requests.post(
-        WP_URL,
-        json=payload,
-        headers={
-            "Authorization": f"Bearer {WP_KEY}",
-            "Content-Type": "application/json",
-        },
-        timeout=120,
-    )
-
-    if response.status_code == 200:
-        print(f"✅ WordPress : {response.json()}")
-    else:
-        print(f"❌ Erreur WordPress ({response.status_code}) : {response.text}")
-        sys.exit(1)
+        await diagnostic(url)
 
 
 if __name__ == "__main__":
