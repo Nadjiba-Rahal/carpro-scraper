@@ -31,8 +31,10 @@ def fetch_via_scrapingant(url: str) -> str:
                 "x-api-key": SCRAPINGANT_KEY,
                 "browser": "true",
                 "proxy_country": "fr",
+                "proxy_type": "residential",  # Utilisation de proxys résidentiels
+                "wait_for_selector": ".js-search-results-json", # À adapter, voir ci-dessous
             },
-            timeout=90,
+            timeout=120, # Augmenté pour laisser le temps au WAF
         )
     except Exception as e:
         print(f"   ❌ Erreur réseau : {e}")
@@ -45,7 +47,6 @@ def fetch_via_scrapingant(url: str) -> str:
     else:
         print(f"   ❌ HTTP {response.status_code} : {response.text[:200]}")
         return ""
-
 
 def extract_sale_urls(html: str) -> list:
     """Extrait les URLs des ventes actives depuis la page d'accueil."""
