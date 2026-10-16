@@ -8,7 +8,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -22,19 +22,11 @@ jobs:
       - name: Installer les dépendances
         run: |
           pip install --upgrade pip
-          pip install playwright playwright-stealth requests beautifulsoup4
+          pip install playwright playwright-stealth curl_cffi beautifulsoup4 requests
           python -m playwright install --with-deps chromium
 
-      - name: Lancer le diagnostic
+      - name: Lancer le scraper
         env:
           WP_URL: ${{ secrets.WP_URL }}
           WP_API_KEY: ${{ secrets.WP_API_KEY }}
         run: python scraper.py
-
-      - name: Upload debug HTML
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-html
-          path: debug_vpauto.html
-          if-no-files-found: ignore
