@@ -19,21 +19,25 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Installer Chrome
-        uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: stable
+      - name: Installer Chrome + xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget xvfb unzip
+          # Chrome version compatible
+          wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get install -y /tmp/chrome.deb
 
-      - name: Installer les dépendances
+      - name: Installer les dépendances Python
         run: |
           pip install --upgrade pip
-          pip install selenium beautifulsoup4 requests
+          pip install undetected-chromedriver==3.5.5 beautifulsoup4 requests
 
-      - name: Lancer le scraper
+      - name: Lancer le scraper (avec xvfb)
         env:
           WP_URL: ${{ secrets.WP_URL }}
           WP_API_KEY: ${{ secrets.WP_API_KEY }}
-        run: python scraper.py
+        run: |
+          xvfb-run -a --server-args="-screen 0 1920x1080x24" python scraper.py
 
       - name: Upload debug HTML
         if: always()
