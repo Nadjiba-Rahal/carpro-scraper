@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -18,20 +19,14 @@ VPAUTO_HOME = "https://www.vpauto.fr/"
 BATCH_SIZE = 5
 MIN_IMAGES = 6
 
-# === RATE LIMITING / ROTATION ===
-MAX_EVENTS_PER_RUN = 3
-DELAY_BETWEEN_EVENTS = 4
-DELAY_BETWEEN_DETAILS = 2.0
-DETAIL_RETRIES = 3
+MAX_EVENTS_PER_RUN = 1        # ← UN SEUL EVENT
 SKIP_IF_RECENT_HOURS = 4
-MAX_PARTIAL_RATE = 0.7  # abort si >70% pages partielles
 
 
 # ==========================================
-# API WP helpers
+# API
 # ==========================================
 def api_get_scraped():
-    """Récupère les events scrapés récemment"""
     try:
         r = cffi_requests.get(
             f"{WP_BASE}/carpro/v1/scraped-events",
@@ -42,12 +37,25 @@ def api_get_scraped():
         if r.status_code == 200:
             return r.json().get("events", {})
     except Exception as e:
-        print(f"   ⚠️ scraped-events: {e}")
+        print(f"⚠️ scraped-events: {e}")
     return {}
 
 
+def api_get_imported_refs():
+    try:
+        r = cffi_requests.get(
+            f"{WP_BASE}/carpro/v1/imported-refs",
+            headers={"Authorization": f"Bearer {WP_KEY}"},
+            timeout=60, impersonate="chrome",
+        )
+        if r.status_code == 200:
+            return set(r.json().get("refs", []))
+    except Exception as e:
+        print(f"⚠️ imported-refs: {e}")
+    return set()
+
+
 def api_send(payload):
-    """Envoie un batch à WP"""
     for attempt in range(3):
         try:
             r = cffi_requests.post(
@@ -64,12 +72,11 @@ def api_send(payload):
 
 
 # ==========================================
-# Extraction date fin
+# Extract sale end date
 # ==========================================
 def extract_sale_end(soup):
     page_text = soup.get_text(" ", strip=True)
 
-    # Countdown "X Jours Y Heures Z Minutes W Secondes"
     m = re.search(
         r"Ouverture\s+(?:de\s+la\s+vente|du\s+live)?\s*:?\s*"
         r"(\d+)\s*Jours?\s*(\d+)\s*Heures?\s*"
@@ -82,7 +89,6 @@ def extract_sale_end(soup):
         if total > 0:
             return (datetime.datetime.utcnow() + datetime.timedelta(seconds=total)).strftime("%Y-%m-%d %H:%M:%S")
 
-    # "Le DD/MM/YY" + "Ouverture du live à HH:MM"
     m_date = re.search(r"Le\s+(\d{2})/(\d{2})/(\d{2,4})", page_text)
     m_time = re.search(r"Ouverture\s+du\s+live\s+à\s+(\d{1,2})[:h](\d{2})", page_text, re.I)
     if m_date:
@@ -95,7 +101,6 @@ def extract_sale_end(soup):
         except ValueError:
             pass
 
-    # JSON-LD
     for s in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(s.string or "")
@@ -110,26 +115,15 @@ def extract_sale_end(soup):
 # ==========================================
 # Fetch
 # ==========================================
-def fetch_curl(url, min_size=40000, retries=3, require_images=False):
+def fetch_curl(url, min_size=40000, retries=2):
     for i in range(retries + 1):
         try:
             r = cffi_requests.get(url, impersonate="chrome", timeout=30, allow_redirects=True)
             if r.status_code == 200 and len(r.text) > min_size:
-                if require_images:
-                    # Tolérant : n'importe quelle image vpauto
-                    n = len(re.findall(
-                        r'https?://[^"\'\s]*vpauto[^"\'\s]*\.(?:jpg|jpeg|png|webp)',
-                        r.text, re.I
-                    ))
-                    if n < 5:
-                        wait = 2 + (i * 2)
-                        print(f"      ⚠️ Page partielle ({n} imgs), retry dans {wait}s")
-                        time.sleep(wait)
-                        continue
                 return r.text
         except Exception:
             pass
-        time.sleep(1 + i)
+        time.sleep(2 + i)
     return ""
 
 
@@ -225,16 +219,15 @@ def parse_list(html):
 
 
 # ==========================================
-# Parse détail
+# Parse détail (FIX v5)
 # ==========================================
 def parse_detail(html):
     soup = BeautifulSoup(html, "html.parser")
     extra = {}
 
-    # ============ IMAGES ============
+    # Images
     photos, seen = [], set()
-
-    def is_vp_photo(u):
+    def is_vp(u):
         if not u: return False
         if any(x in u.lower() for x in ['/logo', '/icon', '/flag', '/avatar', 'sprite', 'placeholder', 'critair', 'badge', '/bundles/']):
             return False
@@ -242,80 +235,66 @@ def parse_detail(html):
 
     for img in soup.find_all("img"):
         for attr in ['src', 'data-src', 'data-original', 'data-large', 'data-zoom']:
-            src = img.get(attr) or ""
-            if is_vp_photo(src) and src not in seen:
-                photos.append(src); seen.add(src)
-        srcset = img.get("srcset") or ""
-        for part in srcset.split(","):
+            s = img.get(attr) or ""
+            if is_vp(s) and s not in seen:
+                photos.append(s); seen.add(s)
+        for part in (img.get("srcset") or "").split(","):
             u = part.strip().split(" ")[0]
-            if is_vp_photo(u) and u not in seen:
+            if is_vp(u) and u not in seen:
                 photos.append(u); seen.add(u)
 
-    grouped, others = {}, []
+    grouped = {}
     for u in photos:
         m = re.search(r'([A-Za-z0-9_-]+)_(\d+)-(\d+)\.(?:jpg|jpeg|png|webp)$', u, re.I)
         if m:
-            prefix = m.group(1) + "_" + m.group(2)
-            size = int(m.group(3))
-            if prefix not in grouped or size > grouped[prefix][1]:
-                grouped[prefix] = (u, size)
-        else:
-            others.append(u)
-
-    final = [u for _, (u, _) in sorted(grouped.items())] + others
+            key = m.group(1) + "_" + m.group(2)
+            sz = int(m.group(3))
+            if key not in grouped or sz > grouped[key][1]:
+                grouped[key] = (u, sz)
+    final = [u for _, (u, _) in sorted(grouped.items())]
     final = [re.sub(r'-\d+\.(jpg|jpeg|png|webp)$', r'-1200.\1', u, flags=re.I) for u in final]
+    if final: extra["images"] = final
 
-    if final:
-        extra["images"] = final
-
-    # ============ TEXT ============
     text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
 
     def find(p, g=1):
         m = re.search(p, text, re.I)
         return m.group(g).strip() if m else ""
 
-    def find_int(p, g=1):
-        """Extrait le PREMIER entier trouvé (évite concaténation)"""
-        m = re.search(p, text, re.I)
-        if not m:
-            return 0
-        s = m.group(g).strip()
-        # Prend seulement le premier groupe de chiffres (avec espaces optionnels)
-        first = re.match(r"(\d[\d\s]*)", s)
-        if not first:
-            return 0
-        return clean_int(first.group(1))
+    # 🔥 ÉNERGIE — robuste
+    info_match = re.search(
+        r"Informations\s+générales(.+?)(?:Observation|Equipements|Équipements|Etat\s+du|Caractéristiques|$)",
+        text, re.I
+    )
+    info_text = info_match.group(1) if info_match else text
 
-    # ============ ÉNERGIE (fix accent) ============
-    # Accepte "Energie", "Énergie", "ENERGIE"
-    fuel = find(r"[ÉE]?[Nn][ÉEe]?rgie\s*:\s*(Essence|Diesel|[ÉE]lectrique|[ÉE]LECTRIQUE|Hybride|Hybride rechargeable|GPL|GNV|Hydrogène)")
-    if not fuel:
-        # Fallback : recherche directe d'un mot énergie connu
-        for kw in ['Électrique', 'Electrique', 'ELECTRIQUE', 'Diesel', 'Essence', 'Hybride']:
-            if re.search(rf"\b{kw}\b", text):
-                fuel = kw
-                break
-    if fuel:
-        # Normalise
-        fuel_norm = fuel.strip()
-        if fuel_norm.upper() in ('ELECTRIQUE', 'ÉLECTRIQUE'):
-            fuel_norm = 'Électrique'
-        elif fuel_norm.lower() == 'diesel':
-            fuel_norm = 'Diesel'
-        elif fuel_norm.lower() == 'essence':
-            fuel_norm = 'Essence'
-        extra["fuel"] = fuel_norm
+    fuel_m = re.search(r"Energie\s*:\s*([A-Za-zÀ-ÿ]+)", info_text, re.I)
+    if not fuel_m:
+        fuel_m = re.search(r"Energie\s*:\s*([A-Za-zÀ-ÿ]+)", text, re.I)
+    if fuel_m:
+        fuel_val = fuel_m.group(1).strip().lower()
+        if 'électr' in fuel_val or 'electr' in fuel_val:
+            extra["fuel"] = "Électrique"
+        elif 'diesel' in fuel_val:
+            extra["fuel"] = "Diesel"
+        elif 'essence' in fuel_val:
+            extra["fuel"] = "Essence"
+        elif 'hybride' in fuel_val:
+            extra["fuel"] = "Hybride"
+        elif 'gpl' in fuel_val:
+            extra["fuel"] = "GPL"
+        else:
+            extra["fuel"] = fuel_m.group(1).strip()
 
-    # ============ BOÎTE ============
+    # Boîte
     gearbox = find(r"Type\s+de\s+boite\s*:\s*(Automatique|Manuelle|Semi-automatique)")
     if gearbox: extra["gearbox"] = gearbox
 
-    # ============ MISE EN CIRCULATION ============
+    # Mise en circulation
     d1 = find(r"Mise\s+en\s+circulation\s*:\s*(\d{2}/\d{2}/\d{4})")
     if d1: extra["first_registration"] = d1
 
-    # ============ CARACTÉRISTIQUES ============
+    # Caractéristiques
     for k, p in {
         "cylindree": r"Cylindrée\s*:\s*(\d+)",
         "puissance_fiscale": r"CV\s*\(fiscaux?\)\s*:\s*(\d+)",
@@ -334,54 +313,50 @@ def parse_detail(html):
         v = find(p)
         if v: extra[k] = v
 
-    # TVA (affiche "Oui" ou "Non")
     tva = find(r"TVA\s*:\s*(Oui|Non)")
     if tva: extra["tva_oui_non"] = tva
 
-    # Crit'Air
     crit_air = find(r"Crit'?Air\s*:?\s*(\d)")
     if crit_air: extra["crit_air"] = crit_air
 
-    # Carnet / suivi
     carnet = find(r"Carnet\s+d'Entretien\s*:\s*(Oui|Non)")
     if carnet: extra["carnet_entretien"] = carnet
     suivi = find(r"Suivi\s+d'Entretien\s*:\s*(Oui|Non)")
     if suivi: extra["suivi_entretien"] = suivi
 
-    # Couleur
     couleur = find(r"Couleur\s*:\s*([A-Za-zÀ-ÿ\s\-']+?)(?:\s+TVA|\s+Carrosserie|$)")
     if couleur: extra["couleur"] = couleur.strip()
 
-    # Carrosserie
     carrosserie = find(r"Carrosserie\s*:\s*([A-Za-zÀ-ÿ\s\-']+?)(?:\s+Carnet|\s+CO2|$)")
     if carrosserie: extra["carrosserie"] = carrosserie.strip()
 
-    # ============ COTE / PRIX NEUF / MISE À PRIX ============
-    # Cote peut être "Cote2 :" ou "Cote :" (avec chiffre exposant)
-    cote = find_int(r"Cote\d?\s*:\s*([\d\s]+?)(?:\s*€|\s+Prix|\s+$)")
-    if cote: extra["cote"] = cote
+    # 🔥 COTE
+    cote_m = re.search(r"Cote\d?\s*:\s*(\d[\d\s]*?)\s*€", text, re.I)
+    if cote_m:
+        v = clean_int(cote_m.group(1))
+        if 0 < v < 1_000_000:
+            extra["cote"] = v
 
-    prix_neuf = find_int(r"Prix\s+neuf\d?\s*:\s*([\d\s]+?)(?:\s*€|\s+[A-Z]|\s*$)")
-    if prix_neuf: extra["prix_neuf"] = prix_neuf
+    prix_neuf_m = re.search(r"Prix\s+neuf\d?\s*:\s*(\d[\d\s]*?)\s*€", text, re.I)
+    if prix_neuf_m:
+        v = clean_int(prix_neuf_m.group(1))
+        if 0 < v < 10_000_000:
+            extra["prix_neuf"] = v
 
-    # Mise à prix — capture UNIQUEMENT le premier nombre
-    mise_prix_match = re.search(r"Mise\s+à\s+prix\s*:?\s*(\d[\d\s]*?)(?:\s*€|\s+\d{2}\s|$)", text, re.I)
-    if mise_prix_match:
-        raw = mise_prix_match.group(1).strip()
-        # Prend juste le premier nombre (ex: "26 300" mais pas "25 500 26 300")
-        first_num = re.match(r"(\d[\d\s]*?)", raw)
-        if first_num:
-            mise_prix_val = clean_int(first_num.group(1))
-            if mise_prix_val > 0:
-                extra["mise_a_prix"] = mise_prix_val
+    # 🔥 MISE À PRIX — cap à 1M
+    mise_m = re.search(r"Mise\s+à\s+prix\s*:?\s*(\d[\d\s]{0,15})", text, re.I)
+    if mise_m:
+        digits = re.sub(r"\D", "", mise_m.group(1))
+        if 3 <= len(digits) <= 7:
+            extra["mise_a_prix"] = int(digits)
 
-    # ============ DÉFAUTS ============
+    # Défauts
     obs = re.search(r"Observation\(s\)\s*(.+?)(?:Equipements|Équipements|Caractéristiques|Etat\s+du|$)", text, re.I)
     if obs:
         o = re.sub(r"\s*-\s*", " • ", obs.group(1).strip()).strip(" •")
         if o: extra["defauts_signales"] = o
 
-    # ============ ÉQUIPEMENTS ============
+    # Équipements
     eq = re.search(r"(?:Equipements|Équipements)\s*/?\s*Options?\s*(.+?)(?:Etat\s+du|Caractéristiques|$)", text, re.I)
     if eq:
         items = [e.strip() for e in re.split(r"[.;•]|\s{2,}", eq.group(1)) if len(e.strip()) > 5]
@@ -391,96 +366,132 @@ def parse_detail(html):
 
 
 # ==========================================
-# Traitement d'un event
+# Fetch détails (Playwright)
 # ==========================================
-def process_event(code, url, terminated_events):
+async def fetch_details_batch(non_sold, already_imported, sale_end, code):
+    valid = []
+    skipped = 0
+    aborted = False
+    partial = 0
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox", "--disable-dev-shm-usage",
+        ])
+        ctx = await browser.new_context(
+            viewport={"width": 1920, "height": 1080},
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            locale="fr-FR", timezone_id="Europe/Paris",
+        )
+        page = await ctx.new_page()
+        await Stealth().apply_stealth_async(page)
+
+        for i, v in enumerate(non_sold, 1):
+            # Skip si déjà importé
+            if v["id"] in already_imported:
+                v["_fin_enchere"] = sale_end
+                v["_event_id"] = code
+                v["images"] = []
+                valid.append(v)
+                skipped += 1
+                print(f"      [{i:02d}] ⏭️  {v['brand']} {v['detailed_model'][:30]} (skip)")
+                continue
+
+            try:
+                await page.goto(v["_url"], wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(random.uniform(3.5, 5))
+                html = await page.content()
+                v.update(parse_detail(html))
+                n = len(v.get("images", []))
+            except Exception as e:
+                print(f"      [{i:02d}] ⚠️ {str(e)[:50]}")
+                n = 0
+
+            if n >= MIN_IMAGES:
+                v["_fin_enchere"] = sale_end
+                v["_event_id"] = code
+                valid.append(v)
+                print(f"      [{i:02d}] ✅ {v['brand']} {v['detailed_model'][:30]} → {n} img")
+            else:
+                partial += 1
+                print(f"      [{i:02d}] ⏭️  {v['brand']} {v['detailed_model'][:30]} → {n} img")
+
+            # Abort si rate limit massif
+            if i >= 15 and (partial / i) > 0.7:
+                print(f"   ⚠️ {partial}/{i} partielles → abort")
+                aborted = True
+                break
+
+            await asyncio.sleep(random.uniform(2, 3))
+
+        await browser.close()
+
+    return valid, skipped, aborted
+
+
+# ==========================================
+# Traitement event
+# ==========================================
+async def process_event(code, url, terminated, already_imported):
     print(f"\n   📋 Vente {code}")
     html = fetch_curl(url, min_size=40000, retries=2)
     if not html:
         print(f"   ❌ Fetch échoué")
-        return {"action": "fetch_failed"}
+        return
 
     soup = BeautifulSoup(html, "html.parser")
     sale_end = extract_sale_end(soup)
     print(f"   ⏰ Fin : {sale_end or 'non trouvée'}")
 
-    # Skip si terminée
     if sale_end:
         try:
             fin_dt = datetime.datetime.strptime(sale_end, "%Y-%m-%d %H:%M:%S")
             if fin_dt < datetime.datetime.utcnow():
-                print(f"   ⏹️ Terminée (date passée) → cleanup")
-                terminated_events.append(code)
-                return {"action": "skipped_past"}
+                print(f"   ⏹️ Terminée → cleanup")
+                terminated.append(code)
+                return
         except Exception:
             pass
 
     vehicles = parse_list(html)
     print(f"   📦 {len(vehicles)} véhicules")
-    if not vehicles:
-        return {"action": "empty"}
+    if not vehicles: return
 
     non_sold = [v for v in vehicles if (v.get("_sale_state") or "").lower()
                 not in ("adjugé", "adjuge", "vendu", "terminé", "termine")]
-
     if not non_sold:
-        print(f"   ⏹️ Tous vendus → cleanup")
-        terminated_events.append(code)
-        return {"action": "skipped_terminated"}
+        print(f"   ⏹️ Tous vendus")
+        terminated.append(code)
+        return
 
-    print(f"   ✅ Actif ({len(non_sold)}/{len(vehicles)})")
+    already = sum(1 for v in non_sold if v["id"] in already_imported)
+    print(f"   ✅ Actif ({len(non_sold)}/{len(vehicles)}) | {already} déjà importés")
 
-    valid = []
-    partial = 0
-    total = 0
-    aborted = False
+    valid, skipped, aborted = await fetch_details_batch(non_sold, already_imported, sale_end, code)
 
-    for i, v in enumerate(non_sold, 1):
-        total += 1
-        dh = fetch_curl(v["_url"], min_size=50000, retries=DETAIL_RETRIES, require_images=True)
-
-        n_img = 0
-        if dh:
-            v.update(parse_detail(dh))
-            n_img = len(v.get("images", []))
-
-        if n_img < MIN_IMAGES:
-            partial += 1
-
-        if n_img >= MIN_IMAGES:
-            v["_fin_enchere"] = sale_end
-            v["_event_id"] = code
-            valid.append(v)
-            print(f"      [{i:02d}] ✅ {v['brand']} {v['detailed_model'][:30]} → {n_img} img")
-        else:
-            print(f"      [{i:02d}] ⏭️ {v['brand']} {v['detailed_model'][:30]} → {n_img} img")
-
-        if total >= 10 and (partial / total) > MAX_PARTIAL_RATE:
-            print(f"   ⚠️ {partial}/{total} pages partielles → abort (rate limit)")
-            aborted = True
-            break
-
-        time.sleep(DELAY_BETWEEN_DETAILS)
-
-    print(f"   📊 Importables: {len(valid)}/{len(non_sold)}" + (" (aborted)" if aborted else ""))
+    print(f"   📊 Importables: {len(valid)}/{len(non_sold)} ({skipped} skip, {len(valid)-skipped} fetch)" + (" [aborted]" if aborted else ""))
 
     if valid:
-        # Cleanup SEULEMENT si pas aborted (sinon risque de trash des valides)
-        result = api_send({
-            "source": "VPauto",
-            "event_id": code,
-            "vehicules": valid,
-            "active_refs": [v["id"] for v in vehicles],
-            "cleanup": not aborted,
-            "terminated_events": [],
-        })
-        print(f"   ✅ WP: {result}")
-
-    return {"action": "imported", "importables": len(valid), "aborted": aborted}
+        batches = [valid[i:i+BATCH_SIZE] for i in range(0, len(valid), BATCH_SIZE)]
+        for i, batch in enumerate(batches):
+            is_last = (i == len(batches) - 1)
+            result = api_send({
+                "source": "VPauto",
+                "event_id": code,
+                "vehicules": batch,
+                "active_refs": [v["id"] for v in vehicles] if is_last else [],
+                "cleanup": is_last and not aborted,
+                "terminated_events": [],
+                "aborted": aborted,
+                "complete": not aborted,
+            })
+            print(f"      ✅ WP batch {i+1}/{len(batches)}: {result}")
+            time.sleep(2)
 
 
 # ==========================================
-# MAIN
+# Main
 # ==========================================
 async def main():
     print("🏠 Fetch homepage...")
@@ -488,11 +499,9 @@ async def main():
     if not home_html or len(home_html) < 30000:
         home_html = await fetch_playwright(VPAUTO_HOME)
     if not home_html:
-        print("❌ Homepage inaccessible")
-        sys.exit(1)
+        print("❌ Homepage inaccessible"); sys.exit(1)
     print(f"   ✅ {len(home_html)} caractères")
 
-    # Events
     soup = BeautifulSoup(home_html, "html.parser")
     events = {}
     for a in soup.find_all("a", href=True):
@@ -500,42 +509,41 @@ async def main():
         if "/rechercher/vente/" in href or "sale=" in href:
             m = re.search(r"/(?:vente|sale)[=/]([A-Z0-9]+)", href)
             if m:
-                code = m.group(1)
                 full = "https://www.vpauto.fr" + href if href.startswith("/") else href
-                events[code] = full.split("#")[0]
+                events[m.group(1)] = full.split("#")[0]
 
-    print(f"🎯 {len(events)} ventes détectées")
+    print(f"🎯 {len(events)} ventes")
 
-    # Scraped récemment
     scraped = api_get_scraped()
     print(f"⏭️ {len(scraped)} ventes scrapées < {SKIP_IF_RECENT_HOURS}h")
 
-    # Filtre
     candidates = [(c, u) for c, u in events.items() if c not in scraped]
     print(f"📋 Candidats: {len(candidates)}/{len(events)}")
 
     if not candidates:
-        print("⚠️ Toutes les ventes sont fraîches, rien à faire.")
-        return
+        print("⚠️ Aucun candidat."); return
 
-    # Traite MAX_EVENTS_PER_RUN
+    # 🔥 TRI : les plus anciens (ou jamais scrapés) d'abord
+    candidates.sort(key=lambda x: scraped.get(x[0], '0000-00-00 00:00:00'))
+
+    already_imported = api_get_imported_refs()
+    print(f"ℹ️ {len(already_imported)} refs déjà importés")
+
     to_process = candidates[:MAX_EVENTS_PER_RUN]
-    print(f"▶️ Traitement: {len(to_process)} ventes (max {MAX_EVENTS_PER_RUN})")
+    print(f"▶️ Traitement: {len(to_process)} vente(s)")
 
     terminated = []
     for i, (code, url) in enumerate(to_process, 1):
         print(f"\n[{i}/{len(to_process)}] {code}")
-        process_event(code, url, terminated)
-        if i < len(to_process):
-            time.sleep(DELAY_BETWEEN_EVENTS)
+        await process_event(code, url, terminated, already_imported)
 
-    # Cleanup des terminées
     if terminated:
         print(f"\n🗑️ Cleanup {len(terminated)} terminées")
         api_send({
             "source": "VPauto", "event_id": "",
             "vehicules": [], "active_refs": [],
             "cleanup": False, "terminated_events": terminated,
+            "aborted": False, "complete": True,
         })
 
     print(f"\n🎯 TERMINÉ")
