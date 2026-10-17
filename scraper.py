@@ -13,21 +13,19 @@ from playwright_stealth import Stealth
 WP_URL = os.environ["WP_URL"]
 WP_KEY = os.environ["WP_API_KEY"]
 
+# ⚙️ CONFIG
 VPAUTO_URL = "https://www.vpauto.fr/vehicule/liste?event=43301"
 BATCH_SIZE = 3
-MIN_IMAGES = 6  # 1 principale + 5 galerie
+MIN_IMAGES = 6
 
-# Extrait l'ID event depuis l'URL
 _m = re.search(r"event=(\d+)", VPAUTO_URL)
 EVENT_ID = _m.group(1) if _m else ""
 
 
-# ============================================
-# EXTRACTION DATE FIN DE VENTE
-# ============================================
+# ==========================================
+# EXTRACTION DATE FIN D'ENCHÈRE
+# ==========================================
 def extract_sale_end(soup) -> str:
-    """Essaie d'extraire la date/heure de fin d'enchère."""
-
     # 1. JSON-LD Event
     for script in soup.find_all("script", type="application/ld+json"):
         try:
@@ -44,7 +42,7 @@ def extract_sale_end(soup) -> str:
         if meta and meta.get("content"):
             return meta["content"]
 
-    # 3. Texte "Fin dans Xh Ym Zs"
+    # 3. Texte "Fin dans Xh Ym"
     page_text = soup.get_text(" ", strip=True)
     m = re.search(
         r"(?:Fin|Se termine)(?:\s+dans)?\s*[:\-]?\s*"
@@ -64,7 +62,7 @@ def extract_sale_end(soup) -> str:
             end = datetime.datetime.utcnow() + datetime.timedelta(seconds=total)
             return end.strftime("%Y-%m-%d %H:%M:%S")
 
-    # 4. Date dans le titre "Vente du DD month YYYY"
+    # 4. Fallback "Vente du DD month YYYY" → 17h
     h1 = soup.find("h1")
     if h1:
         title = h1.get_text(strip=True)
@@ -79,15 +77,14 @@ def extract_sale_end(soup) -> str:
             }
             month_num = months.get(month_name.lower(), 0)
             if month_num:
-                # Les enchères finissent généralement à 18h00 heure locale
                 return f"{year}-{month_num:02d}-{int(day):02d} 17:00:00"
 
     return ""
 
 
-# ============================================
-# FETCH LISTE
-# ============================================
+# ==========================================
+# FETCH LISTE (Playwright)
+# ==========================================
 async def fetch_list():
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -120,9 +117,6 @@ async def fetch_list():
         return html
 
 
-# ============================================
-# PARSE LISTE
-# ============================================
 def clean_int(t):
     if not t:
         return 0
@@ -130,6 +124,9 @@ def clean_int(t):
     return int(n) if n else 0
 
 
+# ==========================================
+# PARSE LISTE
+# ==========================================
 def parse_list(html):
     soup = BeautifulSoup(html, "html.parser")
     vehicles = []
@@ -203,9 +200,9 @@ def parse_list(html):
     return vehicles
 
 
-# ============================================
-# FETCH + PARSE DETAIL
-# ============================================
+# ==========================================
+# FETCH DETAIL
+# ==========================================
 def fetch_detail(url, retries=3):
     for attempt in range(retries + 1):
         try:
@@ -286,9 +283,9 @@ def parse_detail(html):
     return extra
 
 
-# ============================================
-# ENVOI PAR BATCH
-# ============================================
+# ==========================================
+# ENVOI BATCH
+# ==========================================
 def send_batch(vehicles, active_refs, batch_num, total_batches):
     payload = {
         "source": "VPauto",
@@ -299,7 +296,7 @@ def send_batch(vehicles, active_refs, batch_num, total_batches):
         "cleanup": True,
     }
 
-    print(f"\n📤 Batch {batch_num}/{total_batches} ({len(vehicles)} véhicules)...")
+    print(f"\n📤 Batch {batch_num}/{total_batches} ({len(vehicles)} véhicules | {len(active_refs)} refs actives)...")
 
     for attempt in range(3):
         try:
@@ -324,22 +321,22 @@ def send_batch(vehicles, active_refs, batch_num, total_batches):
     return False
 
 
-# ============================================
+# ==========================================
 # MAIN
-# ============================================
+# ==========================================
 async def main():
     list_html = await fetch_list()
     if len(list_html) < 50000:
         print("❌ HTML trop petit")
         sys.exit(1)
 
-    # Extraire la date de fin de vente
+    # Date de fin
     list_soup = BeautifulSoup(list_html, "html.parser")
     sale_end = extract_sale_end(list_soup)
     if sale_end:
         print(f"⏰ Fin de vente : {sale_end}")
     else:
-        print("⚠️  Date de fin de vente non trouvée")
+        print("⚠️  Date de fin non trouvée (vente peut-être terminée)")
 
     all_vehicles = parse_list(list_html)
     print(f"\n📦 {len(all_vehicles)} véhicules dans la liste")
@@ -347,36 +344,45 @@ async def main():
     if not all_vehicles:
         sys.exit(0)
 
-    print(f"\n🔍 Extraction des détails (filtre : ≥{MIN_IMAGES} images, non adjugés)...")
-    valid_vehicles = []
+    print(f"\n🔍 Extraction des détails (filtre : ≥{MIN_IMAGES} images, actif uniquement)...")
+    valid_vehicles = []       # Ceux qui seront importés/MAJ
+    active_refs = []          # TOUS les véhicules actifs (même <6 images) - pour cleanup
     skipped_sold = 0
     skipped_few_imgs = 0
     skipped_no_detail = 0
 
     for i, v in enumerate(all_vehicles, 1):
-        # Skip si déjà adjugé/vendu (dans la liste)
-        state = v.get("_sale_state", "").lower()
+        state = (v.get("_sale_state") or "").lower()
+
+        # Skip les vendus/adjugés (ne pas fetch le detail)
         if state in ("adjugé", "adjuge", "vendu", "terminé", "termine"):
-            print(f"   [{i:02d}] ⏭️  {v['brand']} {v['detailed_model'][:30]} → déjà {v['_sale_state']}")
+            print(f"   [{i:02d}] ⏭️  {v['brand']} {v['detailed_model'][:30]} → {v['_sale_state']}")
             skipped_sold += 1
             continue
 
+        # Fetch détail
         dh = fetch_detail(v["_url"], retries=3)
         if not dh:
             print(f"   [{i:02d}] ❌ {v['brand']} {v['detailed_model'][:30]} → détail KO")
             skipped_no_detail += 1
+            active_refs.append(v["id"])  # on garde actif pour pas le trashed
             time.sleep(0.3)
             continue
 
         extra = parse_detail(dh)
         v.update(extra)
 
-        # Re-check après parsing détail (état peut être différent)
-        if v.get("_sale_state", "").lower() in ("adjugé", "adjuge", "vendu"):
+        # Re-check après parsing détail
+        state_after = (v.get("_sale_state") or "").lower()
+        if state_after in ("adjugé", "adjuge", "vendu"):
             print(f"   [{i:02d}] ⏭️  {v['brand']} {v['detailed_model'][:30]} → vendu (skip)")
             skipped_sold += 1
             continue
 
+        # Ce véhicule est actif → toujours l'ajouter à active_refs
+        active_refs.append(v["id"])
+
+        # Vérifie le nombre d'images
         img_count = len(v.get("images", []))
         if img_count >= MIN_IMAGES:
             v["_fin_enchere"] = sale_end
@@ -388,22 +394,22 @@ async def main():
 
         time.sleep(0.4)
 
-    # Résumé
     print(f"\n{'='*60}")
     print(f"📊 Résumé :")
-    print(f"   Total liste         : {len(all_vehicles)}")
-    print(f"   ✅ Valides (actifs) : {len(valid_vehicles)}")
-    print(f"   ⏭️  Vendus/Adjugés   : {skipped_sold}")
-    print(f"   ⏭️  < {MIN_IMAGES} images      : {skipped_few_imgs}")
-    print(f"   ❌ Détail KO         : {skipped_no_detail}")
+    print(f"   Total liste           : {len(all_vehicles)}")
+    print(f"   ✅ Valides (importés) : {len(valid_vehicles)}")
+    print(f"   🛡️  Actifs (protégés)  : {len(active_refs)}")
+    print(f"   ⏭️  Vendus/Adjugés     : {skipped_sold}")
+    print(f"   ⏭️  < {MIN_IMAGES} images        : {skipped_few_imgs}")
+    print(f"   ❌ Détail KO           : {skipped_no_detail}")
     print(f"{'='*60}")
 
     if not valid_vehicles:
-        print("\n⚠️ Aucun véhicule valide, arrêt.")
+        print("\n⚠️ Aucun véhicule valide à importer.")
+        # On envoie quand même le cleanup (au cas où tout est vendu)
+        if active_refs:
+            send_batch([], active_refs, 1, 1)
         sys.exit(0)
-
-    # Refs actives (pour cleanup côté WP)
-    active_refs = [v["id"] for v in valid_vehicles]
 
     # Aperçu
     print(f"\n--- Aperçu 3 premiers ---")
@@ -413,7 +419,7 @@ async def main():
             f"{v['price']:>7}€ | {len(v['images'])} imgs | {v.get('fuel', 'N/A')}"
         )
 
-    # Envoi par batch
+    # Envoi par batches
     total_batches = (len(valid_vehicles) + BATCH_SIZE - 1) // BATCH_SIZE
     success_count = 0
 
