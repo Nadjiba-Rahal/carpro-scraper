@@ -19,12 +19,13 @@ VPAUTO_HOME = "https://www.vpauto.fr/"
 BATCH_SIZE = 5
 MIN_IMAGES = 6
 
-MAX_EVENTS_PER_RUN = 1        # ← UN SEUL EVENT
-SKIP_IF_RECENT_HOURS = 4
+# ⚙️ CONFIG — 1 event/run pour respecter le rate limit
+MAX_EVENTS_PER_RUN = 1
+SKIP_IF_RECENT_HOURS = 8  # Ne retraite un event qu'après 8h (au lieu de 4h)
 
 
 # ==========================================
-# API
+# API WordPress
 # ==========================================
 def api_get_scraped():
     try:
@@ -72,7 +73,7 @@ def api_send(payload):
 
 
 # ==========================================
-# Extract sale end date
+# Date fin enchère
 # ==========================================
 def extract_sale_end(soup):
     page_text = soup.get_text(" ", strip=True)
@@ -219,13 +220,13 @@ def parse_list(html):
 
 
 # ==========================================
-# Parse détail (FIX v5)
+# Parse détail (TOUS fixes appliqués)
 # ==========================================
 def parse_detail(html):
     soup = BeautifulSoup(html, "html.parser")
     extra = {}
 
-    # Images
+    # ---------- IMAGES ----------
     photos, seen = [], set()
     def is_vp(u):
         if not u: return False
@@ -255,13 +256,14 @@ def parse_detail(html):
     final = [re.sub(r'-\d+\.(jpg|jpeg|png|webp)$', r'-1200.\1', u, flags=re.I) for u in final]
     if final: extra["images"] = final
 
+    # ---------- TEXTE ----------
     text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
 
     def find(p, g=1):
         m = re.search(p, text, re.I)
         return m.group(g).strip() if m else ""
 
-    # 🔥 ÉNERGIE — robuste
+    # ---------- ÉNERGIE ----------
     info_match = re.search(
         r"Informations\s+générales(.+?)(?:Observation|Equipements|Équipements|Etat\s+du|Caractéristiques|$)",
         text, re.I
@@ -272,29 +274,23 @@ def parse_detail(html):
     if not fuel_m:
         fuel_m = re.search(r"Energie\s*:\s*([A-Za-zÀ-ÿ]+)", text, re.I)
     if fuel_m:
-        fuel_val = fuel_m.group(1).strip().lower()
-        if 'électr' in fuel_val or 'electr' in fuel_val:
-            extra["fuel"] = "Électrique"
-        elif 'diesel' in fuel_val:
-            extra["fuel"] = "Diesel"
-        elif 'essence' in fuel_val:
-            extra["fuel"] = "Essence"
-        elif 'hybride' in fuel_val:
-            extra["fuel"] = "Hybride"
-        elif 'gpl' in fuel_val:
-            extra["fuel"] = "GPL"
-        else:
-            extra["fuel"] = fuel_m.group(1).strip()
+        fv = fuel_m.group(1).strip().lower()
+        if 'électr' in fv or 'electr' in fv: extra["fuel"] = "Électrique"
+        elif 'diesel' in fv: extra["fuel"] = "Diesel"
+        elif 'essence' in fv: extra["fuel"] = "Essence"
+        elif 'hybride' in fv: extra["fuel"] = "Hybride"
+        elif 'gpl' in fv: extra["fuel"] = "GPL"
+        else: extra["fuel"] = fuel_m.group(1).strip()
 
-    # Boîte
+    # ---------- BOÎTE ----------
     gearbox = find(r"Type\s+de\s+boite\s*:\s*(Automatique|Manuelle|Semi-automatique)")
     if gearbox: extra["gearbox"] = gearbox
 
-    # Mise en circulation
+    # ---------- MISE EN CIRCULATION ----------
     d1 = find(r"Mise\s+en\s+circulation\s*:\s*(\d{2}/\d{2}/\d{4})")
     if d1: extra["first_registration"] = d1
 
-    # Caractéristiques
+    # ---------- CARACTÉRISTIQUES ----------
     for k, p in {
         "cylindree": r"Cylindrée\s*:\s*(\d+)",
         "puissance_fiscale": r"CV\s*\(fiscaux?\)\s*:\s*(\d+)",
@@ -330,33 +326,32 @@ def parse_detail(html):
     carrosserie = find(r"Carrosserie\s*:\s*([A-Za-zÀ-ÿ\s\-']+?)(?:\s+Carnet|\s+CO2|$)")
     if carrosserie: extra["carrosserie"] = carrosserie.strip()
 
-    # 🔥 COTE
-    cote_m = re.search(r"Cote\d?\s*:\s*(\d[\d\s]*?)\s*€", text, re.I)
+    # ---------- COTE (fix \d*) ----------
+    cote_m = re.search(r"Cote\d*\s*:\s*(\d[\d\s]*?)\s*€", text, re.I)
     if cote_m:
         v = clean_int(cote_m.group(1))
         if 0 < v < 1_000_000:
             extra["cote"] = v
 
-    prix_neuf_m = re.search(r"Prix\s+neuf\d?\s*:\s*(\d[\d\s]*?)\s*€", text, re.I)
+    prix_neuf_m = re.search(r"Prix\s+neuf\d*\s*:\s*(\d[\d\s]*?)\s*€", text, re.I)
     if prix_neuf_m:
         v = clean_int(prix_neuf_m.group(1))
         if 0 < v < 10_000_000:
             extra["prix_neuf"] = v
 
-    # 🔥 MISE À PRIX — cap à 1M
     mise_m = re.search(r"Mise\s+à\s+prix\s*:?\s*(\d[\d\s]{0,15})", text, re.I)
     if mise_m:
         digits = re.sub(r"\D", "", mise_m.group(1))
         if 3 <= len(digits) <= 7:
             extra["mise_a_prix"] = int(digits)
 
-    # Défauts
+    # ---------- DÉFAUTS ----------
     obs = re.search(r"Observation\(s\)\s*(.+?)(?:Equipements|Équipements|Caractéristiques|Etat\s+du|$)", text, re.I)
     if obs:
         o = re.sub(r"\s*-\s*", " • ", obs.group(1).strip()).strip(" •")
         if o: extra["defauts_signales"] = o
 
-    # Équipements
+    # ---------- ÉQUIPEMENTS ----------
     eq = re.search(r"(?:Equipements|Équipements)\s*/?\s*Options?\s*(.+?)(?:Etat\s+du|Caractéristiques|$)", text, re.I)
     if eq:
         items = [e.strip() for e in re.split(r"[.;•]|\s{2,}", eq.group(1)) if len(e.strip()) > 5]
@@ -388,7 +383,6 @@ async def fetch_details_batch(non_sold, already_imported, sale_end, code):
         await Stealth().apply_stealth_async(page)
 
         for i, v in enumerate(non_sold, 1):
-            # Skip si déjà importé
             if v["id"] in already_imported:
                 v["_fin_enchere"] = sale_end
                 v["_event_id"] = code
@@ -417,7 +411,7 @@ async def fetch_details_batch(non_sold, already_imported, sale_end, code):
                 partial += 1
                 print(f"      [{i:02d}] ⏭️  {v['brand']} {v['detailed_model'][:30]} → {n} img")
 
-            # Abort si rate limit massif
+            # Abort si trop de partielles
             if i >= 15 and (partial / i) > 0.7:
                 print(f"   ⚠️ {partial}/{i} partielles → abort")
                 aborted = True
@@ -491,7 +485,7 @@ async def process_event(code, url, terminated, already_imported):
 
 
 # ==========================================
-# Main
+# MAIN
 # ==========================================
 async def main():
     print("🏠 Fetch homepage...")
@@ -523,7 +517,7 @@ async def main():
     if not candidates:
         print("⚠️ Aucun candidat."); return
 
-    # 🔥 TRI : les plus anciens (ou jamais scrapés) d'abord
+    # Trie par plus ancien scrapé (ou jamais)
     candidates.sort(key=lambda x: scraped.get(x[0], '0000-00-00 00:00:00'))
 
     already_imported = api_get_imported_refs()
