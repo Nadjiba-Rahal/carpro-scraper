@@ -17,15 +17,16 @@ WP_BASE = WP_URL.rsplit('/carpro/', 1)[0]
 
 VPAUTO_HOME = "https://www.vpauto.fr/"
 BATCH_SIZE = 5
-MIN_IMAGES = 6
 
-# ⚙️ CONFIG — 1 event/run pour respecter le rate limit
+# ⚙️ CONFIG
+MIN_IMAGES_FULL = 6       # Import "complet" (avec détails)
+MIN_IMAGES_PARTIAL = 1    # Import "partiel" (listing only, si bloqué)
 MAX_EVENTS_PER_RUN = 1
-SKIP_IF_RECENT_HOURS = 8  # Ne retraite un event qu'après 8h (au lieu de 4h)
+SKIP_IF_RECENT_HOURS = 8
 
 
 # ==========================================
-# API WordPress
+# API
 # ==========================================
 def api_get_scraped():
     try:
@@ -73,7 +74,7 @@ def api_send(payload):
 
 
 # ==========================================
-# Date fin enchère
+# Date fin
 # ==========================================
 def extract_sale_end(soup):
     page_text = soup.get_text(" ", strip=True)
@@ -220,13 +221,12 @@ def parse_list(html):
 
 
 # ==========================================
-# Parse détail (TOUS fixes appliqués)
+# Parse détail (tous fixes)
 # ==========================================
 def parse_detail(html):
     soup = BeautifulSoup(html, "html.parser")
     extra = {}
 
-    # ---------- IMAGES ----------
     photos, seen = [], set()
     def is_vp(u):
         if not u: return False
@@ -256,14 +256,12 @@ def parse_detail(html):
     final = [re.sub(r'-\d+\.(jpg|jpeg|png|webp)$', r'-1200.\1', u, flags=re.I) for u in final]
     if final: extra["images"] = final
 
-    # ---------- TEXTE ----------
     text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
 
     def find(p, g=1):
         m = re.search(p, text, re.I)
         return m.group(g).strip() if m else ""
 
-    # ---------- ÉNERGIE ----------
     info_match = re.search(
         r"Informations\s+générales(.+?)(?:Observation|Equipements|Équipements|Etat\s+du|Caractéristiques|$)",
         text, re.I
@@ -282,15 +280,12 @@ def parse_detail(html):
         elif 'gpl' in fv: extra["fuel"] = "GPL"
         else: extra["fuel"] = fuel_m.group(1).strip()
 
-    # ---------- BOÎTE ----------
     gearbox = find(r"Type\s+de\s+boite\s*:\s*(Automatique|Manuelle|Semi-automatique)")
     if gearbox: extra["gearbox"] = gearbox
 
-    # ---------- MISE EN CIRCULATION ----------
     d1 = find(r"Mise\s+en\s+circulation\s*:\s*(\d{2}/\d{2}/\d{4})")
     if d1: extra["first_registration"] = d1
 
-    # ---------- CARACTÉRISTIQUES ----------
     for k, p in {
         "cylindree": r"Cylindrée\s*:\s*(\d+)",
         "puissance_fiscale": r"CV\s*\(fiscaux?\)\s*:\s*(\d+)",
@@ -326,7 +321,6 @@ def parse_detail(html):
     carrosserie = find(r"Carrosserie\s*:\s*([A-Za-zÀ-ÿ\s\-']+?)(?:\s+Carnet|\s+CO2|$)")
     if carrosserie: extra["carrosserie"] = carrosserie.strip()
 
-    # ---------- COTE (fix \d*) ----------
     cote_m = re.search(r"Cote\d*\s*:\s*(\d[\d\s]*?)\s*€", text, re.I)
     if cote_m:
         v = clean_int(cote_m.group(1))
@@ -345,13 +339,11 @@ def parse_detail(html):
         if 3 <= len(digits) <= 7:
             extra["mise_a_prix"] = int(digits)
 
-    # ---------- DÉFAUTS ----------
     obs = re.search(r"Observation\(s\)\s*(.+?)(?:Equipements|Équipements|Caractéristiques|Etat\s+du|$)", text, re.I)
     if obs:
         o = re.sub(r"\s*-\s*", " • ", obs.group(1).strip()).strip(" •")
         if o: extra["defauts_signales"] = o
 
-    # ---------- ÉQUIPEMENTS ----------
     eq = re.search(r"(?:Equipements|Équipements)\s*/?\s*Options?\s*(.+?)(?:Etat\s+du|Caractéristiques|$)", text, re.I)
     if eq:
         items = [e.strip() for e in re.split(r"[.;•]|\s{2,}", eq.group(1)) if len(e.strip()) > 5]
@@ -361,13 +353,14 @@ def parse_detail(html):
 
 
 # ==========================================
-# Fetch détails (Playwright)
+# Fetch détails — MODE PARTIAL
 # ==========================================
 async def fetch_details_batch(non_sold, already_imported, sale_end, code):
     valid = []
     skipped = 0
-    aborted = False
-    partial = 0
+    full_count = 0
+    partial_count = 0
+    blocked = False
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=[
@@ -386,10 +379,21 @@ async def fetch_details_batch(non_sold, already_imported, sale_end, code):
             if v["id"] in already_imported:
                 v["_fin_enchere"] = sale_end
                 v["_event_id"] = code
+                v["_quality"] = "skip"
                 v["images"] = []
                 valid.append(v)
                 skipped += 1
                 print(f"      [{i:02d}] ⏭️  {v['brand']} {v['detailed_model'][:30]} (skip)")
+                continue
+
+            # Si déjà bloqué, import direct en partial (sans fetch)
+            if blocked:
+                v["_fin_enchere"] = sale_end
+                v["_event_id"] = code
+                v["_quality"] = "partial"
+                valid.append(v)
+                partial_count += 1
+                print(f"      [{i:02d}] 📄 {v['brand']} {v['detailed_model'][:30]} (listing only)")
                 continue
 
             try:
@@ -402,26 +406,33 @@ async def fetch_details_batch(non_sold, already_imported, sale_end, code):
                 print(f"      [{i:02d}] ⚠️ {str(e)[:50]}")
                 n = 0
 
-            if n >= MIN_IMAGES:
+            if n >= MIN_IMAGES_FULL:
                 v["_fin_enchere"] = sale_end
                 v["_event_id"] = code
+                v["_quality"] = "full"
                 valid.append(v)
+                full_count += 1
                 print(f"      [{i:02d}] ✅ {v['brand']} {v['detailed_model'][:30]} → {n} img")
+            elif n >= MIN_IMAGES_PARTIAL:
+                v["_fin_enchere"] = sale_end
+                v["_event_id"] = code
+                v["_quality"] = "partial"
+                valid.append(v)
+                partial_count += 1
+                print(f"      [{i:02d}] 📄 {v['brand']} {v['detailed_model'][:30]} → {n} img (partial)")
             else:
-                partial += 1
-                print(f"      [{i:02d}] ⏭️  {v['brand']} {v['detailed_model'][:30]} → {n} img")
+                print(f"      [{i:02d}] ⏭️  {v['brand']} {v['detailed_model'][:30]} → 0 img")
 
-            # Abort si trop de partielles
-            if i >= 15 and (partial / i) > 0.7:
-                print(f"   ⚠️ {partial}/{i} partielles → abort")
-                aborted = True
-                break
+            # Détection blocage : 3 pages consécutives partielles → mode listing
+            if i >= 3 and partial_count >= i - 1 and full_count == 0:
+                print(f"   ⚠️ Blocage détecté ({partial_count}/{i}) → mode listing pour les restants")
+                blocked = True
 
             await asyncio.sleep(random.uniform(2, 3))
 
         await browser.close()
 
-    return valid, skipped, aborted
+    return valid, skipped, full_count, partial_count, blocked
 
 
 # ==========================================
@@ -462,9 +473,12 @@ async def process_event(code, url, terminated, already_imported):
     already = sum(1 for v in non_sold if v["id"] in already_imported)
     print(f"   ✅ Actif ({len(non_sold)}/{len(vehicles)}) | {already} déjà importés")
 
-    valid, skipped, aborted = await fetch_details_batch(non_sold, already_imported, sale_end, code)
+    valid, skipped, full, partial, blocked = await fetch_details_batch(
+        non_sold, already_imported, sale_end, code
+    )
 
-    print(f"   📊 Importables: {len(valid)}/{len(non_sold)} ({skipped} skip, {len(valid)-skipped} fetch)" + (" [aborted]" if aborted else ""))
+    status = "BLOCKED" if blocked else "OK"
+    print(f"   📊 Importables: {len(valid)}/{len(non_sold)} | ✅ full: {full} | 📄 partial: {partial} | ⏭️ skip: {skipped} [{status}]")
 
     if valid:
         batches = [valid[i:i+BATCH_SIZE] for i in range(0, len(valid), BATCH_SIZE)]
@@ -475,10 +489,10 @@ async def process_event(code, url, terminated, already_imported):
                 "event_id": code,
                 "vehicules": batch,
                 "active_refs": [v["id"] for v in vehicles] if is_last else [],
-                "cleanup": is_last and not aborted,
+                "cleanup": is_last,
                 "terminated_events": [],
-                "aborted": aborted,
-                "complete": not aborted,
+                "blocked": blocked,
+                "complete": True,
             })
             print(f"      ✅ WP batch {i+1}/{len(batches)}: {result}")
             time.sleep(2)
@@ -517,11 +531,10 @@ async def main():
     if not candidates:
         print("⚠️ Aucun candidat."); return
 
-    # Trie par plus ancien scrapé (ou jamais)
     candidates.sort(key=lambda x: scraped.get(x[0], '0000-00-00 00:00:00'))
 
     already_imported = api_get_imported_refs()
-    print(f"ℹ️ {len(already_imported)} refs déjà importés")
+    print(f"ℹ️ {len(already_imported)} refs full (non-partial)")
 
     to_process = candidates[:MAX_EVENTS_PER_RUN]
     print(f"▶️ Traitement: {len(to_process)} vente(s)")
@@ -537,7 +550,7 @@ async def main():
             "source": "VPauto", "event_id": "",
             "vehicules": [], "active_refs": [],
             "cleanup": False, "terminated_events": terminated,
-            "aborted": False, "complete": True,
+            "blocked": False, "complete": True,
         })
 
     print(f"\n🎯 TERMINÉ")
