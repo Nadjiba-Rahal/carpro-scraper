@@ -2,13 +2,13 @@ name: CarPro Import VPauto
 
 on:
   schedule:
-    - cron: '0 6,18 * * *'
+    - cron: '0 */2 * * *'   # toutes les 2h
   workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
