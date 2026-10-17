@@ -231,7 +231,7 @@ def parse_detail(html):
     soup = BeautifulSoup(html, "html.parser")
     extra = {}
 
-    # IMAGES — multi-CDN
+    # ============ IMAGES ============
     photos, seen = [], set()
 
     def is_vp_photo(u):
@@ -251,7 +251,6 @@ def parse_detail(html):
             if is_vp_photo(u) and u not in seen:
                 photos.append(u); seen.add(u)
 
-    # Dédup par préfixe + upgrade 1200px
     grouped, others = {}, []
     for u in photos:
         m = re.search(r'([A-Za-z0-9_-]+)_(\d+)-(\d+)\.(?:jpg|jpeg|png|webp)$', u, re.I)
@@ -269,21 +268,58 @@ def parse_detail(html):
     if final:
         extra["images"] = final
 
-    # INFOS TECHNIQUES
+    # ============ TEXT ============
     text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
 
     def find(p, g=1):
         m = re.search(p, text, re.I)
         return m.group(g).strip() if m else ""
 
+    def find_int(p, g=1):
+        """Extrait le PREMIER entier trouvé (évite concaténation)"""
+        m = re.search(p, text, re.I)
+        if not m:
+            return 0
+        s = m.group(g).strip()
+        # Prend seulement le premier groupe de chiffres (avec espaces optionnels)
+        first = re.match(r"(\d[\d\s]*)", s)
+        if not first:
+            return 0
+        return clean_int(first.group(1))
+
+    # ============ ÉNERGIE (fix accent) ============
+    # Accepte "Energie", "Énergie", "ENERGIE"
+    fuel = find(r"[ÉE]?[Nn][ÉEe]?rgie\s*:\s*(Essence|Diesel|[ÉE]lectrique|[ÉE]LECTRIQUE|Hybride|Hybride rechargeable|GPL|GNV|Hydrogène)")
+    if not fuel:
+        # Fallback : recherche directe d'un mot énergie connu
+        for kw in ['Électrique', 'Electrique', 'ELECTRIQUE', 'Diesel', 'Essence', 'Hybride']:
+            if re.search(rf"\b{kw}\b", text):
+                fuel = kw
+                break
+    if fuel:
+        # Normalise
+        fuel_norm = fuel.strip()
+        if fuel_norm.upper() in ('ELECTRIQUE', 'ÉLECTRIQUE'):
+            fuel_norm = 'Électrique'
+        elif fuel_norm.lower() == 'diesel':
+            fuel_norm = 'Diesel'
+        elif fuel_norm.lower() == 'essence':
+            fuel_norm = 'Essence'
+        extra["fuel"] = fuel_norm
+
+    # ============ BOÎTE ============
+    gearbox = find(r"Type\s+de\s+boite\s*:\s*(Automatique|Manuelle|Semi-automatique)")
+    if gearbox: extra["gearbox"] = gearbox
+
+    # ============ MISE EN CIRCULATION ============
+    d1 = find(r"Mise\s+en\s+circulation\s*:\s*(\d{2}/\d{2}/\d{4})")
+    if d1: extra["first_registration"] = d1
+
+    # ============ CARACTÉRISTIQUES ============
     for k, p in {
-        "fuel": r"Energie\s*:\s*(Essence|Diesel|Électrique|Electrique|Hybride|Hybride rechargeable|GPL|GNV|Hydrogène)",
-        "gearbox": r"Type\s+de\s+boite\s*:\s*(Automatique|Manuelle|Semi-automatique)",
-        "first_registration": r"Mise\s+en\s+circulation\s*:\s*(\d{2}/\d{2}/\d{4})",
         "cylindree": r"Cylindrée\s*:\s*(\d+)",
         "puissance_fiscale": r"CV\s*\(fiscaux?\)\s*:\s*(\d+)",
         "puissance_moteur": r"Puissance\s*\(ch\)\s*:\s*(\d+)",
-        "tva_oui_non": r"TVA\s*:\s*(Oui|Non)",
         "nombre_portes": r"Nombre\s+de\s+portes\s*:\s*(\d+)",
         "places": r"Nombre\s+de\s+places(?:\s+carte\s+grise)?\s*:\s*(\d+)",
         "nombre_vitesses": r"(?:Nbre|Nombre)\s+de\s+vitesses?\s*:\s*(\d+)",
@@ -291,36 +327,61 @@ def parse_detail(html):
         "longueur_cm": r"Longueur\s*\(cm\)\s*:\s*(\d+)",
         "hauteur_cm": r"Hauteur\s*\(cm\)\s*:\s*(\d+)",
         "co2": r"CO2\s*\(g/km\)\s*:\s*(\d+)",
-        "crit_air": r"Crit'Air\s*:?\s*(\d)",
         "norme_euro": r"Norme\s+Euro\s*:\s*(\d)",
-        "carnet_entretien": r"Carnet\s+d'Entretien\s*:\s*(Oui|Non)",
-        "suivi_entretien": r"Suivi\s+d'Entretien\s*:\s*(Oui|Non)",
         "genre": r"Genre\s*:\s*(\w+)",
         "vin": r"\b([A-HJ-NPR-Z0-9]{17})\b",
     }.items():
         v = find(p)
         if v: extra[k] = v
 
+    # TVA (affiche "Oui" ou "Non")
+    tva = find(r"TVA\s*:\s*(Oui|Non)")
+    if tva: extra["tva_oui_non"] = tva
+
+    # Crit'Air
+    crit_air = find(r"Crit'?Air\s*:?\s*(\d)")
+    if crit_air: extra["crit_air"] = crit_air
+
+    # Carnet / suivi
+    carnet = find(r"Carnet\s+d'Entretien\s*:\s*(Oui|Non)")
+    if carnet: extra["carnet_entretien"] = carnet
+    suivi = find(r"Suivi\s+d'Entretien\s*:\s*(Oui|Non)")
+    if suivi: extra["suivi_entretien"] = suivi
+
+    # Couleur
     couleur = find(r"Couleur\s*:\s*([A-Za-zÀ-ÿ\s\-']+?)(?:\s+TVA|\s+Carrosserie|$)")
     if couleur: extra["couleur"] = couleur.strip()
 
+    # Carrosserie
     carrosserie = find(r"Carrosserie\s*:\s*([A-Za-zÀ-ÿ\s\-']+?)(?:\s+Carnet|\s+CO2|$)")
     if carrosserie: extra["carrosserie"] = carrosserie.strip()
 
-    cote = find(r"Cote\s*:\s*([\d\s]+)\s*€")
-    if cote: extra["cote"] = clean_int(cote)
-    prix_neuf = find(r"Prix\s+neuf\s*:\s*([\d\s]+)\s*€")
-    if prix_neuf: extra["prix_neuf"] = clean_int(prix_neuf)
-    mise_prix = find(r"Mise\s+à\s+prix\s*([\d\s]+)\s*€")
-    if mise_prix: extra["mise_a_prix"] = clean_int(mise_prix)
+    # ============ COTE / PRIX NEUF / MISE À PRIX ============
+    # Cote peut être "Cote2 :" ou "Cote :" (avec chiffre exposant)
+    cote = find_int(r"Cote\d?\s*:\s*([\d\s]+?)(?:\s*€|\s+Prix|\s+$)")
+    if cote: extra["cote"] = cote
 
-    # Défauts
+    prix_neuf = find_int(r"Prix\s+neuf\d?\s*:\s*([\d\s]+?)(?:\s*€|\s+[A-Z]|\s*$)")
+    if prix_neuf: extra["prix_neuf"] = prix_neuf
+
+    # Mise à prix — capture UNIQUEMENT le premier nombre
+    mise_prix_match = re.search(r"Mise\s+à\s+prix\s*:?\s*(\d[\d\s]*?)(?:\s*€|\s+\d{2}\s|$)", text, re.I)
+    if mise_prix_match:
+        raw = mise_prix_match.group(1).strip()
+        # Prend juste le premier nombre (ex: "26 300" mais pas "25 500 26 300")
+        first_num = re.match(r"(\d[\d\s]*?)", raw)
+        if first_num:
+            mise_prix_val = clean_int(first_num.group(1))
+            if mise_prix_val > 0:
+                extra["mise_a_prix"] = mise_prix_val
+
+    # ============ DÉFAUTS ============
     obs = re.search(r"Observation\(s\)\s*(.+?)(?:Equipements|Équipements|Caractéristiques|Etat\s+du|$)", text, re.I)
     if obs:
         o = re.sub(r"\s*-\s*", " • ", obs.group(1).strip()).strip(" •")
         if o: extra["defauts_signales"] = o
 
-    # Équipements
+    # ============ ÉQUIPEMENTS ============
     eq = re.search(r"(?:Equipements|Équipements)\s*/?\s*Options?\s*(.+?)(?:Etat\s+du|Caractéristiques|$)", text, re.I)
     if eq:
         items = [e.strip() for e in re.split(r"[.;•]|\s{2,}", eq.group(1)) if len(e.strip()) > 5]
