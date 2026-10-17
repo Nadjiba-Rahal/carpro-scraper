@@ -2,7 +2,7 @@ name: CarPro Import VPauto
 
 on:
   schedule:
-    - cron: '0 */2 * * *'   # toutes les 2h
+    - cron: '0 6,18 * * *'   # 2x/jour : 6h et 18h UTC
   workflow_dispatch:
 
 jobs:
