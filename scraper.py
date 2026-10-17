@@ -13,8 +13,8 @@ WP_URL = os.environ["WP_URL"]
 WP_KEY = os.environ["WP_API_KEY"]
 
 VPAUTO_URL = "https://www.vpauto.fr/vehicule/liste?event=43301"
-BATCH_SIZE = 10
-MIN_IMAGES = 1  # Skip les véhicules sans image
+BATCH_SIZE = 3
+MIN_IMAGES = 3  # Skip les véhicules sans image
 
 
 async def fetch_list():
@@ -112,11 +112,10 @@ def parse_list(html):
 
 
 def fetch_detail(url, retries=2):
-    """Fetch la page détail avec retry."""
     for attempt in range(retries + 1):
         try:
             r = cffi_requests.get(url, impersonate="chrome", timeout=30, allow_redirects=True)
-            if r.status_code == 200:
+            if r.status_code == 200 and len(r.text) > 50000:  # ← Check taille
                 return r.text
         except Exception:
             pass
@@ -237,7 +236,7 @@ async def main():
     # Vérifie que le HTML est assez gros (sinon retry)
     if dh and len(dh) < 50000:
         print(f"   [{i:02d}] ⚠️  HTML trop petit, retry...")
-        time.sleep(3)
+        time.sleep(5)
         dh = fetch_detail(v["_url"], retries=3)
         if not dh:
             print(f"   [{i:02d}] ❌ {v['brand']} {v['detailed_model'][:30]} → détail KO")
@@ -256,7 +255,7 @@ async def main():
             print(f"   [{i:02d}] ⏭️  {v['brand']} {v['detailed_model'][:30]} → pas d'image (skip)")
             skipped_no_img += 1
 
-        time.sleep(0.4)
+        time.sleep(0.8)
 
     # 3. Résumé
     print(f"\n{'='*60}")
