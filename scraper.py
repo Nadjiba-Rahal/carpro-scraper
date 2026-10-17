@@ -232,7 +232,13 @@ async def main():
     skipped_no_detail = 0
 
     for i, v in enumerate(all_vehicles, 1):
-        dh = fetch_detail(v["_url"])
+    dh = fetch_detail(v["_url"], retries=3)  # Plus de retry
+    
+    # Vérifie que le HTML est assez gros (sinon retry)
+    if dh and len(dh) < 50000:
+        print(f"   [{i:02d}] ⚠️  HTML trop petit, retry...")
+        time.sleep(3)
+        dh = fetch_detail(v["_url"], retries=3)
         if not dh:
             print(f"   [{i:02d}] ❌ {v['brand']} {v['detailed_model'][:30]} → détail KO")
             skipped_no_detail += 1
