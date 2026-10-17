@@ -12,95 +12,124 @@ from playwright_stealth import Stealth
 
 WP_URL = os.environ["WP_URL"]
 WP_KEY = os.environ["WP_API_KEY"]
+WP_BASE = WP_URL.rsplit('/carpro/', 1)[0]
 
 VPAUTO_HOME = "https://www.vpauto.fr/"
 BATCH_SIZE = 5
 MIN_IMAGES = 6
 
-# Délais (anti rate-limit)
-DELAY_BETWEEN_EVENTS = 3
-DELAY_BETWEEN_DETAILS = 1.2
-DETAIL_RETRIES = 4
+# === RATE LIMITING / ROTATION ===
+MAX_EVENTS_PER_RUN = 3
+DELAY_BETWEEN_EVENTS = 4
+DELAY_BETWEEN_DETAILS = 2.0
+DETAIL_RETRIES = 3
+SKIP_IF_RECENT_HOURS = 4
+MAX_PARTIAL_RATE = 0.7  # abort si >70% pages partielles
 
 
 # ==========================================
-# 🕐 EXTRACTION DATE FIN (countdown VPauto)
+# API WP helpers
 # ==========================================
-def extract_sale_end(soup, html=""):
-    """
-    Cherche la date de fin d'enchère.
-    VPauto affiche soit:
-    - "Ouverture de la vente : X Jours Y Heures Z Minutes W Secondes" (compte à rebours)
-    - "Le DD/MM/YY" + "Ouverture du live à HH:MM"
-    """
+def api_get_scraped():
+    """Récupère les events scrapés récemment"""
+    try:
+        r = cffi_requests.get(
+            f"{WP_BASE}/carpro/v1/scraped-events",
+            params={"hours": SKIP_IF_RECENT_HOURS},
+            headers={"Authorization": f"Bearer {WP_KEY}"},
+            timeout=30, impersonate="chrome",
+        )
+        if r.status_code == 200:
+            return r.json().get("events", {})
+    except Exception as e:
+        print(f"   ⚠️ scraped-events: {e}")
+    return {}
 
+
+def api_send(payload):
+    """Envoie un batch à WP"""
+    for attempt in range(3):
+        try:
+            r = cffi_requests.post(
+                WP_URL, json=payload,
+                headers={"Authorization": f"Bearer {WP_KEY}", "Content-Type": "application/json"},
+                timeout=180, impersonate="chrome",
+            )
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
+        time.sleep(3 * (attempt + 1))
+    return None
+
+
+# ==========================================
+# Extraction date fin
+# ==========================================
+def extract_sale_end(soup):
     page_text = soup.get_text(" ", strip=True)
 
-    # PRIORITÉ 1 : Countdown "X Jours Y Heures Z Minutes W Secondes"
+    # Countdown "X Jours Y Heures Z Minutes W Secondes"
     m = re.search(
         r"Ouverture\s+(?:de\s+la\s+vente|du\s+live)?\s*:?\s*"
-        r"(\d+)\s*Jours?\s*"
-        r"(\d+)\s*Heures?\s*"
-        r"(\d+)\s*Minutes?\s*"
-        r"(\d+)\s*Secondes?",
+        r"(\d+)\s*Jours?\s*(\d+)\s*Heures?\s*"
+        r"(\d+)\s*Minutes?\s*(\d+)\s*Secondes?",
         page_text, re.I,
     )
     if m:
-        days = int(m.group(1))
-        hours = int(m.group(2))
-        mins = int(m.group(3))
-        secs = int(m.group(4))
-        total = days * 86400 + hours * 3600 + mins * 60 + secs
+        total = (int(m.group(1)) * 86400 + int(m.group(2)) * 3600
+                 + int(m.group(3)) * 60 + int(m.group(4)))
         if total > 0:
-            end = datetime.datetime.utcnow() + datetime.timedelta(seconds=total)
-            return end.strftime("%Y-%m-%d %H:%M:%S")
+            return (datetime.datetime.utcnow() + datetime.timedelta(seconds=total)).strftime("%Y-%m-%d %H:%M:%S")
 
-    # PRIORITÉ 2 : "Le DD/MM/YY" + "Ouverture du live à HH:MM"
+    # "Le DD/MM/YY" + "Ouverture du live à HH:MM"
     m_date = re.search(r"Le\s+(\d{2})/(\d{2})/(\d{2,4})", page_text)
     m_time = re.search(r"Ouverture\s+du\s+live\s+à\s+(\d{1,2})[:h](\d{2})", page_text, re.I)
     if m_date:
-        day = int(m_date.group(1))
-        month = int(m_date.group(2))
-        year_short = int(m_date.group(3))
-        year = 2000 + year_short if year_short < 100 else year_short
+        day, month, year_s = int(m_date.group(1)), int(m_date.group(2)), int(m_date.group(3))
+        year = 2000 + year_s if year_s < 100 else year_s
         hour = int(m_time.group(1)) if m_time else 14
         minute = int(m_time.group(2)) if m_time else 0
         try:
-            end = datetime.datetime(year, month, day, hour, minute, 0)
-            return end.strftime("%Y-%m-%d %H:%M:%S")
+            return datetime.datetime(year, month, day, hour, minute).strftime("%Y-%m-%d %H:%M:%S")
         except ValueError:
             pass
 
-    # PRIORITÉ 3 : JSON-LD Event
-    for script in soup.find_all("script", type="application/ld+json"):
+    # JSON-LD
+    for s in soup.find_all("script", type="application/ld+json"):
         try:
-            data = json.loads(script.string or "")
+            data = json.loads(s.string or "")
             if isinstance(data, dict) and data.get("@type") == "Event" and data.get("endDate"):
                 return str(data["endDate"]).replace("+00:00", "").replace("Z", "")
         except Exception:
             pass
 
-    # PRIORITÉ 4 : Meta tags
-    for prop in ["event:end_time", "og:end_time"]:
-        meta = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
-        if meta and meta.get("content"):
-            return meta["content"]
-
     return ""
 
 
 # ==========================================
-# 🌐 FETCH
+# Fetch
 # ==========================================
-def fetch_curl(url, min_size=40000, retries=3):
+def fetch_curl(url, min_size=40000, retries=3, require_images=False):
     for i in range(retries + 1):
         try:
             r = cffi_requests.get(url, impersonate="chrome", timeout=30, allow_redirects=True)
             if r.status_code == 200 and len(r.text) > min_size:
+                if require_images:
+                    # Tolérant : n'importe quelle image vpauto
+                    n = len(re.findall(
+                        r'https?://[^"\'\s]*vpauto[^"\'\s]*\.(?:jpg|jpeg|png|webp)',
+                        r.text, re.I
+                    ))
+                    if n < 5:
+                        wait = 2 + (i * 2)
+                        print(f"      ⚠️ Page partielle ({n} imgs), retry dans {wait}s")
+                        time.sleep(wait)
+                        continue
                 return r.text
         except Exception:
             pass
-        time.sleep(2 + i)
+        time.sleep(1 + i)
     return ""
 
 
@@ -116,8 +145,7 @@ async def fetch_playwright(url):
             locale="fr-FR", timezone_id="Europe/Paris",
         )
         page = await ctx.new_page()
-        stealth = Stealth()
-        await stealth.apply_stealth_async(page)
+        await Stealth().apply_stealth_async(page)
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             await asyncio.sleep(5)
@@ -129,50 +157,7 @@ async def fetch_playwright(url):
 
 
 # ==========================================
-# 🎯 EXTRACTION EVENTS (multi-format)
-# ==========================================
-def extract_event_urls(html):
-    """Détecte /rechercher/vente/VSXXXXX et ?sale=VSXXXXX"""
-    soup = BeautifulSoup(html, "html.parser")
-    urls = {}
-
-    def add(url):
-        if not url:
-            return
-        url = url.split("#")[0]
-        if url.startswith("/"):
-            url = "https://www.vpauto.fr" + url
-        elif not url.startswith("http"):
-            url = "https://www.vpauto.fr/" + url
-
-        # Extrait le code vente (VS000XX)
-        m = re.search(r"/(?:vente|sale)[=/]([A-Z0-9]+)", url)
-        if not m:
-            return
-        code = m.group(1)
-        if code not in urls:
-            urls[code] = url
-
-    # 1. Liens <a href> vers /rechercher/vente/ ou ?sale=
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/rechercher/vente/" in href or "sale=" in href:
-            add(href)
-
-    # 2. Regex brut sur le HTML
-    for m in re.finditer(r'["\']([^"\']*(?:/rechercher/vente/|sale=)[A-Z0-9]+[^"\']*)["\']', html):
-        add(m.group(1))
-
-    return urls  # dict {code: url}
-
-
-def extract_event_code(url):
-    m = re.search(r"/(?:vente|sale)[=/]([A-Z0-9]+)", url)
-    return m.group(1) if m else ""
-
-
-# ==========================================
-# 📋 PARSE LISTE
+# Parse liste
 # ==========================================
 def clean_int(t):
     if not t: return 0
@@ -240,356 +225,257 @@ def parse_list(html):
 
 
 # ==========================================
-# 🔍 PARSE DÉTAIL — TOUS LES CHAMPS
+# Parse détail
 # ==========================================
 def parse_detail(html):
     soup = BeautifulSoup(html, "html.parser")
     extra = {}
 
-    # ============ IMAGES — Multi-CDN ============
+    # IMAGES — multi-CDN
     photos, seen = [], set()
 
-    # On accepte tous les CDN VPauto (cdn.vpauto.fr, fs.vpauto.net, photos.vpauto.fr...)
-    def is_vpauto_photo(url):
-        if not url:
+    def is_vp_photo(u):
+        if not u: return False
+        if any(x in u.lower() for x in ['/logo', '/icon', '/flag', '/avatar', 'sprite', 'placeholder', 'critair', 'badge', '/bundles/']):
             return False
-        # Exclure les logos, icônes, flags, avatars
-        if any(x in url.lower() for x in [
-            '/logo', '/icon', '/flag', '/avatar', 'sprite', 'placeholder',
-            'critair', 'badge', '/bundles/'
-        ]):
-            return False
-        # Doit contenir "vpauto" dans le domaine
-        return 'vpauto' in url and any(url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp'])
+        return 'vpauto' in u and any(u.lower().endswith(e) for e in ['.jpg', '.jpeg', '.png', '.webp'])
 
-    # Étape 1 : Chercher les images dans src, data-src, data-original, data-large
     for img in soup.find_all("img"):
         for attr in ['src', 'data-src', 'data-original', 'data-large', 'data-zoom']:
             src = img.get(attr) or ""
-            if is_vpauto_photo(src) and src not in seen:
-                photos.append(src)
-                seen.add(src)
-
-    # Étape 2 : Chercher dans srcset (souvent contient plusieurs tailles)
-    for img in soup.find_all("img"):
+            if is_vp_photo(src) and src not in seen:
+                photos.append(src); seen.add(src)
         srcset = img.get("srcset") or ""
-        if not srcset:
-            continue
         for part in srcset.split(","):
-            url = part.strip().split(" ")[0]
-            if is_vpauto_photo(url) and url not in seen:
-                photos.append(url)
-                seen.add(url)
+            u = part.strip().split(" ")[0]
+            if is_vp_photo(u) and u not in seen:
+                photos.append(u); seen.add(u)
 
-    # Étape 3 : Dédupliquer par préfixe (garder la plus haute résolution)
-    # VPauto utilise un format : PREFIX_XX-SIZE.jpg
-    # On regroupe par (PREFIX_XX) et garde le fichier le plus grand
-    grouped = {}
-    others = []
-    for url in photos:
-        m = re.search(r'([A-Za-z0-9_-]+)_(\d+)-(\d+)\.(?:jpg|jpeg|png|webp)$', url, re.I)
+    # Dédup par préfixe + upgrade 1200px
+    grouped, others = {}, []
+    for u in photos:
+        m = re.search(r'([A-Za-z0-9_-]+)_(\d+)-(\d+)\.(?:jpg|jpeg|png|webp)$', u, re.I)
         if m:
             prefix = m.group(1) + "_" + m.group(2)
             size = int(m.group(3))
             if prefix not in grouped or size > grouped[prefix][1]:
-                grouped[prefix] = (url, size)
+                grouped[prefix] = (u, size)
         else:
-            others.append(url)
+            others.append(u)
 
-    # Trie par ordre de préfixe pour garder l'ordre (01, 02, 03...)
-    final_photos = [url for prefix, (url, _) in sorted(grouped.items())]
-    final_photos.extend(others)
+    final = [u for _, (u, _) in sorted(grouped.items())] + others
+    final = [re.sub(r'-\d+\.(jpg|jpeg|png|webp)$', r'-1200.\1', u, flags=re.I) for u in final]
 
-    # Étape 4 : Upgrade vers 1200px si on a des images en basse résolution
-    upgraded = []
-    for url in final_photos:
-        if re.search(r'-\d{2,3}\.(?:jpg|jpeg|png|webp)$', url, re.I):
-            # Remplace -80.jpg ou -640.jpg par -1200.jpg
-            hi_res = re.sub(r'-\d+\.(jpg|jpeg|png|webp)$', r'-1200.\1', url, flags=re.I)
-            upgraded.append(hi_res)
-        else:
-            upgraded.append(url)
+    if final:
+        extra["images"] = final
 
-    if upgraded:
-        extra["images"] = upgraded
+    # INFOS TECHNIQUES
+    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
 
-    # ============ INFOS TECHNIQUES ============
-    page_text = soup.get_text(" ", strip=True)
-    text_compact = re.sub(r"\s+", " ", page_text)
+    def find(p, g=1):
+        m = re.search(p, text, re.I)
+        return m.group(g).strip() if m else ""
 
-    def find(pattern, group=1, flags=re.I):
-        m = re.search(pattern, text_compact, flags)
-        return m.group(group).strip() if m else ""
-
-    fuel = find(r"Energie\s*:\s*(Essence|Diesel|Électrique|Electrique|Hybride|Hybride rechargeable|GPL|GNV|Hydrogène)")
-    if fuel: extra["fuel"] = fuel
-
-    gearbox = find(r"Type\s+de\s+boite\s*:\s*(Automatique|Manuelle|Semi-automatique)")
-    if not gearbox:
-        gearbox = find(r"\b(Automatique|Manuelle)\b")
-    if gearbox: extra["gearbox"] = gearbox
-
-    d1 = find(r"Mise\s+en\s+circulation\s*:\s*(\d{2}/\d{2}/\d{4})")
-    if d1: extra["first_registration"] = d1
-
-    cyl = find(r"Cylindrée\s*:\s*(\d+)")
-    if cyl: extra["cylindree"] = cyl
-
-    cv = find(r"CV\s*\(fiscaux?\)\s*:\s*(\d+)")
-    if cv: extra["puissance_fiscale"] = cv
-
-    ch = find(r"Puissance\s*\(ch\)\s*:\s*(\d+)")
-    if ch: extra["puissance_moteur"] = ch
+    for k, p in {
+        "fuel": r"Energie\s*:\s*(Essence|Diesel|Électrique|Electrique|Hybride|Hybride rechargeable|GPL|GNV|Hydrogène)",
+        "gearbox": r"Type\s+de\s+boite\s*:\s*(Automatique|Manuelle|Semi-automatique)",
+        "first_registration": r"Mise\s+en\s+circulation\s*:\s*(\d{2}/\d{2}/\d{4})",
+        "cylindree": r"Cylindrée\s*:\s*(\d+)",
+        "puissance_fiscale": r"CV\s*\(fiscaux?\)\s*:\s*(\d+)",
+        "puissance_moteur": r"Puissance\s*\(ch\)\s*:\s*(\d+)",
+        "tva_oui_non": r"TVA\s*:\s*(Oui|Non)",
+        "nombre_portes": r"Nombre\s+de\s+portes\s*:\s*(\d+)",
+        "places": r"Nombre\s+de\s+places(?:\s+carte\s+grise)?\s*:\s*(\d+)",
+        "nombre_vitesses": r"(?:Nbre|Nombre)\s+de\s+vitesses?\s*:\s*(\d+)",
+        "largeur_cm": r"Largeur\s*\(cm\)\s*:\s*(\d+)",
+        "longueur_cm": r"Longueur\s*\(cm\)\s*:\s*(\d+)",
+        "hauteur_cm": r"Hauteur\s*\(cm\)\s*:\s*(\d+)",
+        "co2": r"CO2\s*\(g/km\)\s*:\s*(\d+)",
+        "crit_air": r"Crit'Air\s*:?\s*(\d)",
+        "norme_euro": r"Norme\s+Euro\s*:\s*(\d)",
+        "carnet_entretien": r"Carnet\s+d'Entretien\s*:\s*(Oui|Non)",
+        "suivi_entretien": r"Suivi\s+d'Entretien\s*:\s*(Oui|Non)",
+        "genre": r"Genre\s*:\s*(\w+)",
+        "vin": r"\b([A-HJ-NPR-Z0-9]{17})\b",
+    }.items():
+        v = find(p)
+        if v: extra[k] = v
 
     couleur = find(r"Couleur\s*:\s*([A-Za-zÀ-ÿ\s\-']+?)(?:\s+TVA|\s+Carrosserie|$)")
     if couleur: extra["couleur"] = couleur.strip()
 
-    tva = find(r"TVA\s*:\s*(Oui|Non)")
-    if tva: extra["tva_oui_non"] = tva
-
     carrosserie = find(r"Carrosserie\s*:\s*([A-Za-zÀ-ÿ\s\-']+?)(?:\s+Carnet|\s+CO2|$)")
     if carrosserie: extra["carrosserie"] = carrosserie.strip()
 
-    portes = find(r"Nombre\s+de\s+portes\s*:\s*(\d+)")
-    if portes: extra["nombre_portes"] = portes
-
-    places = find(r"Nombre\s+de\s+places(?:\s+carte\s+grise)?\s*:\s*(\d+)")
-    if places: extra["places"] = places
-
-    vitesses = find(r"Nbre\s+de\s+vitesses\s*:\s*(\d+)") or find(r"Nombre\s+de\s+vitesses?\s*:\s*(\d+)")
-    if vitesses: extra["nombre_vitesses"] = vitesses
-
-    largeur = find(r"Largeur\s*\(cm\)\s*:\s*(\d+)")
-    if largeur: extra["largeur_cm"] = largeur
-    longueur = find(r"Longueur\s*\(cm\)\s*:\s*(\d+)")
-    if longueur: extra["longueur_cm"] = longueur
-    hauteur = find(r"Hauteur\s*\(cm\)\s*:\s*(\d+)")
-    if hauteur: extra["hauteur_cm"] = hauteur
-
-    co2 = find(r"CO2\s*\(g/km\)\s*:\s*(\d+)")
-    if co2: extra["co2"] = co2
-    crit_air = find(r"Crit'Air\s*:?\s*(\d)")
-    if crit_air: extra["crit_air"] = crit_air
-    norme = find(r"Norme\s+Euro\s*:\s*(\d)")
-    if norme: extra["norme_euro"] = norme
-
-    carnet = find(r"Carnet\s+d'Entretien\s*:\s*(Oui|Non)")
-    if carnet: extra["carnet_entretien"] = carnet
-    suivi = find(r"Suivi\s+d'Entretien\s*:\s*(Oui|Non)")
-    if suivi: extra["suivi_entretien"] = suivi
-
-    genre = find(r"Genre\s*:\s*(\w+)")
-    if genre: extra["genre"] = genre
-
     cote = find(r"Cote\s*:\s*([\d\s]+)\s*€")
     if cote: extra["cote"] = clean_int(cote)
-
     prix_neuf = find(r"Prix\s+neuf\s*:\s*([\d\s]+)\s*€")
     if prix_neuf: extra["prix_neuf"] = clean_int(prix_neuf)
-
     mise_prix = find(r"Mise\s+à\s+prix\s*([\d\s]+)\s*€")
     if mise_prix: extra["mise_a_prix"] = clean_int(mise_prix)
 
-    obs_match = re.search(
-        r"Observation\(s\)\s*(.+?)(?:Equipements|Équipements|Caractéristiques|Etat\s+du\s+véhicule|$)",
-        text_compact, re.I
-    )
-    if obs_match:
-        obs_text = obs_match.group(1).strip()
-        obs_text = re.sub(r"\s*-\s*", " • ", obs_text).strip(" •")
-        if obs_text:
-            extra["defauts_signales"] = obs_text
+    # Défauts
+    obs = re.search(r"Observation\(s\)\s*(.+?)(?:Equipements|Équipements|Caractéristiques|Etat\s+du|$)", text, re.I)
+    if obs:
+        o = re.sub(r"\s*-\s*", " • ", obs.group(1).strip()).strip(" •")
+        if o: extra["defauts_signales"] = o
 
-    eq_match = re.search(
-        r"(?:Equipements|Équipements)\s*/?\s*Options?\s*(.+?)(?:Etat\s+du\s+véhicule|Caractéristiques|$)",
-        text_compact, re.I
-    )
-    if eq_match:
-        eq_text = eq_match.group(1).strip()
-        equips = re.findall(r"[A-ZÀ-Ý][^A-ZÀ-Ý]+(?:[a-zà-ÿ'’\-]\s|$)", eq_text)
-        if len(equips) < 2:
-            equips = [e.strip() for e in re.split(r"[.;•]|\s{2,}", eq_text) if len(e.strip()) > 5]
-        if equips:
-            extra["equipements"] = " | ".join([e.strip() for e in equips if e.strip()])
-
-    etat_match = re.search(
-        r"Etat\s+du\s+véhicule.*?Carrosserie\s*(.+?)(?:Réparation|Peinture|Tolerie|Remplacement|$)",
-        text_compact, re.I
-    )
-    if etat_match:
-        etat_text = etat_match.group(1).strip()
-        if etat_text and len(etat_text) > 5:
-            if "defauts_signales" in extra:
-                extra["defauts_signales"] += " • État : " + etat_text
-            else:
-                extra["defauts_signales"] = "État : " + etat_text
-
-    vin = find(r"\b([A-HJ-NPR-Z0-9]{17})\b")
-    if vin: extra["vin"] = vin
+    # Équipements
+    eq = re.search(r"(?:Equipements|Équipements)\s*/?\s*Options?\s*(.+?)(?:Etat\s+du|Caractéristiques|$)", text, re.I)
+    if eq:
+        items = [e.strip() for e in re.split(r"[.;•]|\s{2,}", eq.group(1)) if len(e.strip()) > 5]
+        if items: extra["equipements"] = " | ".join(items)
 
     return extra
 
 
 # ==========================================
-# 📤 ENVOI WP
+# Traitement d'un event
 # ==========================================
-def send_batch(vehicles, event_code, active_refs, cleanup, terminated_events=None):
-    payload = {
-        "source": "VPauto",
-        "event_id": event_code or "",
-        "vehicules": vehicles,
-        "active_refs": active_refs or [],
-        "cleanup": bool(cleanup),
-        "terminated_events": terminated_events or [],
-    }
-    label = "vehicles" if vehicles else "cleanup"
-    print(f"\n📤 [{label}] code={event_code or '-'} | {len(vehicles)} veh | {len(active_refs or [])} refs | {len(terminated_events or [])} terminés")
-    for attempt in range(3):
-        try:
-            r = cffi_requests.post(
-                WP_URL, json=payload,
-                headers={"Authorization": f"Bearer {WP_KEY}", "Content-Type": "application/json"},
-                timeout=180, impersonate="chrome",
-            )
-            if r.status_code == 200:
-                print(f"   ✅ {r.json()}")
-                return True
-            print(f"   ⚠️ HTTP {r.status_code}")
-        except Exception as e:
-            print(f"   ⚠️ {e}")
-        time.sleep(5 * (attempt + 1))
-    return False
-
-
-# ==========================================
-# 📋 TRAITEMENT D'UNE VENTE
-# ==========================================
-def process_event(event_code, event_url, all_active, terminated_events):
-    print(f"\n   📋 Vente {event_code or 'AUTO'}")
-    event_html = fetch_curl(event_url)
-    if not event_html:
+def process_event(code, url, terminated_events):
+    print(f"\n   📋 Vente {code}")
+    html = fetch_curl(url, min_size=40000, retries=2)
+    if not html:
         print(f"   ❌ Fetch échoué")
-        return
+        return {"action": "fetch_failed"}
 
-    event_soup = BeautifulSoup(event_html, "html.parser")
-    sale_end = extract_sale_end(event_soup)
+    soup = BeautifulSoup(html, "html.parser")
+    sale_end = extract_sale_end(soup)
     print(f"   ⏰ Fin : {sale_end or 'non trouvée'}")
 
-    vehicles = parse_list(event_html)
+    # Skip si terminée
+    if sale_end:
+        try:
+            fin_dt = datetime.datetime.strptime(sale_end, "%Y-%m-%d %H:%M:%S")
+            if fin_dt < datetime.datetime.utcnow():
+                print(f"   ⏹️ Terminée (date passée) → cleanup")
+                terminated_events.append(code)
+                return {"action": "skipped_past"}
+        except Exception:
+            pass
+
+    vehicles = parse_list(html)
     print(f"   📦 {len(vehicles)} véhicules")
     if not vehicles:
-        return
+        return {"action": "empty"}
 
     non_sold = [v for v in vehicles if (v.get("_sale_state") or "").lower()
                 not in ("adjugé", "adjuge", "vendu", "terminé", "termine")]
 
     if not non_sold:
-        print(f"   ⏹️ Tous vendus")
-        if event_code:
-            terminated_events.append(event_code)
-        return
+        print(f"   ⏹️ Tous vendus → cleanup")
+        terminated_events.append(code)
+        return {"action": "skipped_terminated"}
 
     print(f"   ✅ Actif ({len(non_sold)}/{len(vehicles)})")
 
     valid = []
-    detail_ok = 0
-    detail_ko = 0
+    partial = 0
+    total = 0
+    aborted = False
 
     for i, v in enumerate(non_sold, 1):
-        detail_html = fetch_curl(v["_url"], min_size=50000, retries=DETAIL_RETRIES)
+        total += 1
+        dh = fetch_curl(v["_url"], min_size=50000, retries=DETAIL_RETRIES, require_images=True)
 
-        if detail_html:
-            extra = parse_detail(detail_html)
-            v.update(extra)
-            detail_ok += 1
-        else:
-            detail_ko += 1
+        n_img = 0
+        if dh:
+            v.update(parse_detail(dh))
+            n_img = len(v.get("images", []))
 
-        if (v.get("_sale_state") or "").lower() in ("adjugé", "adjuge", "vendu"):
-            continue
+        if n_img < MIN_IMAGES:
+            partial += 1
 
-        n_img = len(v.get("images", []))
         if n_img >= MIN_IMAGES:
             v["_fin_enchere"] = sale_end
-            v["_event_id"] = event_code
+            v["_event_id"] = code
             valid.append(v)
             print(f"      [{i:02d}] ✅ {v['brand']} {v['detailed_model'][:30]} → {n_img} img")
         else:
             print(f"      [{i:02d}] ⏭️ {v['brand']} {v['detailed_model'][:30]} → {n_img} img")
 
+        if total >= 10 and (partial / total) > MAX_PARTIAL_RATE:
+            print(f"   ⚠️ {partial}/{total} pages partielles → abort (rate limit)")
+            aborted = True
+            break
+
         time.sleep(DELAY_BETWEEN_DETAILS)
 
-    print(f"   📊 Détails : {detail_ok} OK / {detail_ko} KO / {len(valid)} importables")
+    print(f"   📊 Importables: {len(valid)}/{len(non_sold)}" + (" (aborted)" if aborted else ""))
 
     if valid:
-        all_active.append({
-            "event_id": event_code,
-            "vehicles": valid,
+        # Cleanup SEULEMENT si pas aborted (sinon risque de trash des valides)
+        result = api_send({
+            "source": "VPauto",
+            "event_id": code,
+            "vehicules": valid,
             "active_refs": [v["id"] for v in vehicles],
+            "cleanup": not aborted,
+            "terminated_events": [],
         })
+        print(f"   ✅ WP: {result}")
+
+    return {"action": "imported", "importables": len(valid), "aborted": aborted}
 
 
 # ==========================================
-# 🚀 MAIN
+# MAIN
 # ==========================================
 async def main():
     print("🏠 Fetch homepage...")
     home_html = fetch_curl(VPAUTO_HOME)
     if not home_html or len(home_html) < 30000:
-        print("   → Playwright...")
         home_html = await fetch_playwright(VPAUTO_HOME)
     if not home_html:
         print("❌ Homepage inaccessible")
         sys.exit(1)
     print(f"   ✅ {len(home_html)} caractères")
 
-    events = extract_event_urls(home_html)
-    print(f"\n🎯 {len(events)} ventes détectées")
+    # Events
+    soup = BeautifulSoup(home_html, "html.parser")
+    events = {}
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "/rechercher/vente/" in href or "sale=" in href:
+            m = re.search(r"/(?:vente|sale)[=/]([A-Z0-9]+)", href)
+            if m:
+                code = m.group(1)
+                full = "https://www.vpauto.fr" + href if href.startswith("/") else href
+                events[code] = full.split("#")[0]
 
-    if not events:
-        print("⚠️ Aucune vente détectée")
-        sys.exit(0)
+    print(f"🎯 {len(events)} ventes détectées")
 
-    # Affiche les codes trouvés
-    for code, url in list(events.items())[:10]:
-        print(f"   {code} → {url}")
+    # Scraped récemment
+    scraped = api_get_scraped()
+    print(f"⏭️ {len(scraped)} ventes scrapées < {SKIP_IF_RECENT_HOURS}h")
 
-    all_active = []
-    terminated_events = []
+    # Filtre
+    candidates = [(c, u) for c, u in events.items() if c not in scraped]
+    print(f"📋 Candidats: {len(candidates)}/{len(events)}")
 
-    for idx, (code, url) in enumerate(events.items(), 1):
-        print(f"\n[{idx}/{len(events)}] {code}")
-        process_event(code, url, all_active, terminated_events)
-        time.sleep(DELAY_BETWEEN_EVENTS)
+    if not candidates:
+        print("⚠️ Toutes les ventes sont fraîches, rien à faire.")
+        return
 
-    # RÉSUMÉ
-    print(f"\n{'='*60}")
-    print(f"📊 RÉSUMÉ")
-    print(f"   Ventes traitées   : {len(events)}")
-    print(f"   ✅ Actives         : {len(all_active)}")
-    print(f"   ⏹️ Terminées       : {len(terminated_events)}")
-    total = sum(len(e["vehicles"]) for e in all_active)
-    print(f"   📦 Véhicules valides : {total}")
-    print(f"{'='*60}")
+    # Traite MAX_EVENTS_PER_RUN
+    to_process = candidates[:MAX_EVENTS_PER_RUN]
+    print(f"▶️ Traitement: {len(to_process)} ventes (max {MAX_EVENTS_PER_RUN})")
 
-    if not all_active and not terminated_events:
-        print("\n⚠️ Rien à importer.")
-        sys.exit(0)
+    terminated = []
+    for i, (code, url) in enumerate(to_process, 1):
+        print(f"\n[{i}/{len(to_process)}] {code}")
+        process_event(code, url, terminated)
+        if i < len(to_process):
+            time.sleep(DELAY_BETWEEN_EVENTS)
 
-    # ENVOI
-    for ev in all_active:
-        vehicles = ev["vehicles"]
-        event_code = ev["event_id"]
-        active_refs = ev["active_refs"]
-        batches = [vehicles[i:i+BATCH_SIZE] for i in range(0, len(vehicles), BATCH_SIZE)]
-        for i, batch in enumerate(batches):
-            is_last = (i == len(batches) - 1)
-            send_batch(batch, event_code, active_refs if is_last else [], is_last)
-            time.sleep(3)
-
-    if terminated_events:
-        print(f"\n🗑️ Cleanup {len(terminated_events)} ventes terminées")
-        send_batch([], "", [], False, terminated_events)
+    # Cleanup des terminées
+    if terminated:
+        print(f"\n🗑️ Cleanup {len(terminated)} terminées")
+        api_send({
+            "source": "VPauto", "event_id": "",
+            "vehicules": [], "active_refs": [],
+            "cleanup": False, "terminated_events": terminated,
+        })
 
     print(f"\n🎯 TERMINÉ")
 
