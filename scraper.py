@@ -246,83 +246,119 @@ def parse_detail(html):
     soup = BeautifulSoup(html, "html.parser")
     extra = {}
 
-    # ============ IMAGES ============
+    # ============ IMAGES — Multi-CDN ============
     photos, seen = [], set()
-    for img in soup.find_all("img"):
-        src = img.get("src") or img.get("data-src") or ""
-        if "cdn.vpauto.fr" in src and "-1200.jpg" in src and src not in seen:
-            photos.append(src); seen.add(src)
-    if not photos:
-        for img in soup.find_all("img"):
-            src = img.get("src") or ""
-            if "cdn.vpauto.fr" in src and re.search(r"_\d+-\d+\.jpg", src):
-                hi = re.sub(r"-\d+\.jpg", "-1200.jpg", src)
-                if hi not in seen:
-                    photos.append(hi); seen.add(hi)
-    if photos:
-        extra["images"] = photos
 
-    # ============ TEXTE COMPLET ============
+    # On accepte tous les CDN VPauto (cdn.vpauto.fr, fs.vpauto.net, photos.vpauto.fr...)
+    def is_vpauto_photo(url):
+        if not url:
+            return False
+        # Exclure les logos, icônes, flags, avatars
+        if any(x in url.lower() for x in [
+            '/logo', '/icon', '/flag', '/avatar', 'sprite', 'placeholder',
+            'critair', 'badge', '/bundles/'
+        ]):
+            return False
+        # Doit contenir "vpauto" dans le domaine
+        return 'vpauto' in url and any(url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.webp'])
+
+    # Étape 1 : Chercher les images dans src, data-src, data-original, data-large
+    for img in soup.find_all("img"):
+        for attr in ['src', 'data-src', 'data-original', 'data-large', 'data-zoom']:
+            src = img.get(attr) or ""
+            if is_vpauto_photo(src) and src not in seen:
+                photos.append(src)
+                seen.add(src)
+
+    # Étape 2 : Chercher dans srcset (souvent contient plusieurs tailles)
+    for img in soup.find_all("img"):
+        srcset = img.get("srcset") or ""
+        if not srcset:
+            continue
+        for part in srcset.split(","):
+            url = part.strip().split(" ")[0]
+            if is_vpauto_photo(url) and url not in seen:
+                photos.append(url)
+                seen.add(url)
+
+    # Étape 3 : Dédupliquer par préfixe (garder la plus haute résolution)
+    # VPauto utilise un format : PREFIX_XX-SIZE.jpg
+    # On regroupe par (PREFIX_XX) et garde le fichier le plus grand
+    grouped = {}
+    others = []
+    for url in photos:
+        m = re.search(r'([A-Za-z0-9_-]+)_(\d+)-(\d+)\.(?:jpg|jpeg|png|webp)$', url, re.I)
+        if m:
+            prefix = m.group(1) + "_" + m.group(2)
+            size = int(m.group(3))
+            if prefix not in grouped or size > grouped[prefix][1]:
+                grouped[prefix] = (url, size)
+        else:
+            others.append(url)
+
+    # Trie par ordre de préfixe pour garder l'ordre (01, 02, 03...)
+    final_photos = [url for prefix, (url, _) in sorted(grouped.items())]
+    final_photos.extend(others)
+
+    # Étape 4 : Upgrade vers 1200px si on a des images en basse résolution
+    upgraded = []
+    for url in final_photos:
+        if re.search(r'-\d{2,3}\.(?:jpg|jpeg|png|webp)$', url, re.I):
+            # Remplace -80.jpg ou -640.jpg par -1200.jpg
+            hi_res = re.sub(r'-\d+\.(jpg|jpeg|png|webp)$', r'-1200.\1', url, flags=re.I)
+            upgraded.append(hi_res)
+        else:
+            upgraded.append(url)
+
+    if upgraded:
+        extra["images"] = upgraded
+
+    # ============ INFOS TECHNIQUES ============
     page_text = soup.get_text(" ", strip=True)
-    # Version "compacte" pour les regex (une seule ligne)
     text_compact = re.sub(r"\s+", " ", page_text)
 
-    # ============ CHAMPS SIMPLES ============
     def find(pattern, group=1, flags=re.I):
         m = re.search(pattern, text_compact, flags)
         return m.group(group).strip() if m else ""
 
-    # Énergie
     fuel = find(r"Energie\s*:\s*(Essence|Diesel|Électrique|Electrique|Hybride|Hybride rechargeable|GPL|GNV|Hydrogène)")
     if fuel: extra["fuel"] = fuel
 
-    # Boîte
     gearbox = find(r"Type\s+de\s+boite\s*:\s*(Automatique|Manuelle|Semi-automatique)")
     if not gearbox:
         gearbox = find(r"\b(Automatique|Manuelle)\b")
     if gearbox: extra["gearbox"] = gearbox
 
-    # Mise en circulation
     d1 = find(r"Mise\s+en\s+circulation\s*:\s*(\d{2}/\d{2}/\d{4})")
     if d1: extra["first_registration"] = d1
 
-    # Cylindrée
     cyl = find(r"Cylindrée\s*:\s*(\d+)")
     if cyl: extra["cylindree"] = cyl
 
-    # Puissance fiscale (CV)
     cv = find(r"CV\s*\(fiscaux?\)\s*:\s*(\d+)")
     if cv: extra["puissance_fiscale"] = cv
 
-    # Puissance moteur (ch)
     ch = find(r"Puissance\s*\(ch\)\s*:\s*(\d+)")
     if ch: extra["puissance_moteur"] = ch
 
-    # Couleur
     couleur = find(r"Couleur\s*:\s*([A-Za-zÀ-ÿ\s\-']+?)(?:\s+TVA|\s+Carrosserie|$)")
     if couleur: extra["couleur"] = couleur.strip()
 
-    # TVA
     tva = find(r"TVA\s*:\s*(Oui|Non)")
     if tva: extra["tva_oui_non"] = tva
 
-    # Carrosserie
     carrosserie = find(r"Carrosserie\s*:\s*([A-Za-zÀ-ÿ\s\-']+?)(?:\s+Carnet|\s+CO2|$)")
     if carrosserie: extra["carrosserie"] = carrosserie.strip()
 
-    # Nombre de portes
     portes = find(r"Nombre\s+de\s+portes\s*:\s*(\d+)")
     if portes: extra["nombre_portes"] = portes
 
-    # Nombre de places
     places = find(r"Nombre\s+de\s+places(?:\s+carte\s+grise)?\s*:\s*(\d+)")
     if places: extra["places"] = places
 
-    # Nombre de vitesses
     vitesses = find(r"Nbre\s+de\s+vitesses\s*:\s*(\d+)") or find(r"Nombre\s+de\s+vitesses?\s*:\s*(\d+)")
     if vitesses: extra["nombre_vitesses"] = vitesses
 
-    # Dimensions
     largeur = find(r"Largeur\s*\(cm\)\s*:\s*(\d+)")
     if largeur: extra["largeur_cm"] = largeur
     longueur = find(r"Longueur\s*\(cm\)\s*:\s*(\d+)")
@@ -330,7 +366,6 @@ def parse_detail(html):
     hauteur = find(r"Hauteur\s*\(cm\)\s*:\s*(\d+)")
     if hauteur: extra["hauteur_cm"] = hauteur
 
-    # CO2 / Crit'Air / Norme Euro
     co2 = find(r"CO2\s*\(g/km\)\s*:\s*(\d+)")
     if co2: extra["co2"] = co2
     crit_air = find(r"Crit'Air\s*:?\s*(\d)")
@@ -338,17 +373,14 @@ def parse_detail(html):
     norme = find(r"Norme\s+Euro\s*:\s*(\d)")
     if norme: extra["norme_euro"] = norme
 
-    # Carnet / Suivi entretien
     carnet = find(r"Carnet\s+d'Entretien\s*:\s*(Oui|Non)")
     if carnet: extra["carnet_entretien"] = carnet
     suivi = find(r"Suivi\s+d'Entretien\s*:\s*(Oui|Non)")
     if suivi: extra["suivi_entretien"] = suivi
 
-    # Genre
     genre = find(r"Genre\s*:\s*(\w+)")
     if genre: extra["genre"] = genre
 
-    # ============ COTE / PRIX NEUF / MISE À PRIX ============
     cote = find(r"Cote\s*:\s*([\d\s]+)\s*€")
     if cote: extra["cote"] = clean_int(cote)
 
@@ -358,7 +390,6 @@ def parse_detail(html):
     mise_prix = find(r"Mise\s+à\s+prix\s*([\d\s]+)\s*€")
     if mise_prix: extra["mise_a_prix"] = clean_int(mise_prix)
 
-    # ============ OBSERVATIONS (défauts) ============
     obs_match = re.search(
         r"Observation\(s\)\s*(.+?)(?:Equipements|Équipements|Caractéristiques|Etat\s+du\s+véhicule|$)",
         text_compact, re.I
@@ -369,23 +400,18 @@ def parse_detail(html):
         if obs_text:
             extra["defauts_signales"] = obs_text
 
-    # ============ ÉQUIPEMENTS ============
     eq_match = re.search(
         r"(?:Equipements|Équipements)\s*/?\s*Options?\s*(.+?)(?:Etat\s+du\s+véhicule|Caractéristiques|$)",
         text_compact, re.I
     )
     if eq_match:
         eq_text = eq_match.group(1).strip()
-        # Les équipements sont souvent séparés par des majuscules
-        # On essaie de split sur les débuts de phrase (majuscule après minuscule + espace)
         equips = re.findall(r"[A-ZÀ-Ý][^A-ZÀ-Ý]+(?:[a-zà-ÿ'’\-]\s|$)", eq_text)
         if len(equips) < 2:
-            # Fallback : split sur . ou ; ou double espace
             equips = [e.strip() for e in re.split(r"[.;•]|\s{2,}", eq_text) if len(e.strip()) > 5]
         if equips:
             extra["equipements"] = " | ".join([e.strip() for e in equips if e.strip()])
 
-    # ============ ÉTAT CARROSSERIE ============
     etat_match = re.search(
         r"Etat\s+du\s+véhicule.*?Carrosserie\s*(.+?)(?:Réparation|Peinture|Tolerie|Remplacement|$)",
         text_compact, re.I
@@ -393,13 +419,11 @@ def parse_detail(html):
     if etat_match:
         etat_text = etat_match.group(1).strip()
         if etat_text and len(etat_text) > 5:
-            # Ajoute aux défauts si pas déjà
             if "defauts_signales" in extra:
                 extra["defauts_signales"] += " • État : " + etat_text
             else:
                 extra["defauts_signales"] = "État : " + etat_text
 
-    # ============ VIN ============
     vin = find(r"\b([A-HJ-NPR-Z0-9]{17})\b")
     if vin: extra["vin"] = vin
 
