@@ -13,7 +13,8 @@ WP_URL = os.environ["WP_URL"]
 WP_KEY = os.environ["WP_API_KEY"]
 
 VPAUTO_URL = "https://www.vpauto.fr/vehicule/liste?event=43301"
-MAX_DETAILS = 100
+BATCH_SIZE = 10
+MIN_IMAGES = 1  # Skip les véhicules sans image
 
 
 async def fetch_list():
@@ -105,43 +106,47 @@ def parse_list(html):
                 "year": year,
                 "mileage": km,
             })
-        except Exception as e:
-            print(f"   ⚠️ {e}")
+        except Exception:
             continue
     return vehicles
 
 
-def fetch_detail(url):
-    try:
-        r = cffi_requests.get(url, impersonate="chrome", timeout=30, allow_redirects=True)
-        if r.status_code == 200: return r.text
-    except: pass
+def fetch_detail(url, retries=2):
+    """Fetch la page détail avec retry."""
+    for attempt in range(retries + 1):
+        try:
+            r = cffi_requests.get(url, impersonate="chrome", timeout=30, allow_redirects=True)
+            if r.status_code == 200:
+                return r.text
+        except Exception:
+            pass
+        time.sleep(2)
     return ""
 
 
 def parse_detail(html):
-    """Extrait TOUTES les photos + infos depuis la page détail."""
+    """Extrait photos + infos techniques."""
     soup = BeautifulSoup(html, "html.parser")
     extra = {}
 
-    # ============ IMAGES RÉELLES (toutes celles du CDN) ============
+    # ============ PHOTOS ============
     all_imgs = soup.find_all("img")
     photos = []
     seen = set()
+
+    # Priorité aux 1200px
     for img in all_imgs:
         src = img.get("src") or img.get("data-src") or ""
-        # Filtre uniquement les vraies photos de véhicule (pas les icones)
         if "cdn.vpauto.fr" in src and "-1200.jpg" in src:
             if src not in seen:
                 photos.append(src)
                 seen.add(src)
 
-    # Si pas de 1200px trouvées, cherche les 640px et remplace par 1200
+    # Fallback : upgrade des 640px → 1200px
     if not photos:
         for img in all_imgs:
             src = img.get("src") or ""
             if "cdn.vpauto.fr" in src and re.search(r"_\d+-\d+\.jpg", src):
-                # Ex: KsIFSZW_01-640.jpg → KsIFSZW_01-1200.jpg
                 hi_res = re.sub(r"-\d+\.jpg", "-1200.jpg", src)
                 if hi_res not in seen:
                     photos.append(hi_res)
@@ -149,18 +154,26 @@ def parse_detail(html):
 
     if photos:
         extra["images"] = photos
-        print(f"      🖼️ {len(photos)} photos")
 
-    # ============ FICHE TECHNIQUE ============
+    # ============ INFOS TECHNIQUES ============
     page_text = soup.get_text(" ", strip=True)
 
     # Énergie
-    m = re.search(r"Énergie\s*[:\-]?\s*(Essence|Diesel|Électrique|Hybride|GPL|GNV|Hydrogène)", page_text, re.I)
-    if m: extra["fuel"] = m.group(1)
+    for p in [r"Énergie\s*[:\-]?\s*(Essence|Diesel|Électrique|Electrique|Hybride|Hybride rechargeable|GPL|GNV|Hydrogène)",
+              r"Carburant\s*[:\-]?\s*(Essence|Diesel|Électrique|Electrique|Hybride|GPL|GNV)",
+              r"\b(Essence|Diesel|Électrique|Electrique|Hybride rechargeable|Hybride)\b"]:
+        m = re.search(p, page_text, re.I)
+        if m:
+            extra["fuel"] = m.group(1).strip()
+            break
 
     # Boîte
-    m = re.search(r"Bo[îi]te(?:\s+de\s+vitesse)?\s*[:\-]?\s*(Automatique|Manuelle|Semi-auto)", page_text, re.I)
-    if m: extra["gearbox"] = m.group(1)
+    for p in [r"Bo[îi]te(?:\s+de\s+vitesse)?\s*[:\-]?\s*(Automatique|Manuelle|Semi-automatique)",
+              r"\b(Automatique|Manuelle)\b"]:
+        m = re.search(p, page_text, re.I)
+        if m:
+            extra["gearbox"] = m.group(1).strip()
+            break
 
     # Mise en circulation
     m = re.search(r"[Mm]ise\s+en\s+circulation\s*[:\-]?\s*(\d{2}/\d{2}/\d{4}|\d{2}/\d{4}|\d{4})", page_text)
@@ -170,40 +183,107 @@ def parse_detail(html):
     m = re.search(r"Puissance\s*[:\-]?\s*(\d+\s*(?:ch|kW|CV))", page_text, re.I)
     if m: extra["_puissance"] = m.group(1)
 
-    # VIN / Châssis
-    m = re.search(r"\b(VF[A-Z0-9]{15}|WVW[A-Z0-9]{14}|[A-HJ-NPR-Z0-9]{17})\b", page_text)
+    # VIN
+    m = re.search(r"\b([A-HJ-NPR-Z0-9]{17})\b", page_text)
     if m: extra["vin"] = m.group(1)
 
     return extra
 
 
+def send_batch(vehicles, batch_num, total_batches):
+    """Envoie un batch à WordPress avec retry."""
+    payload = {"source": "VPauto", "total": len(vehicles), "vehicules": vehicles}
+
+    print(f"\n📤 Batch {batch_num}/{total_batches} ({len(vehicles)} véhicules)...")
+
+    for attempt in range(3):
+        try:
+            r = cffi_requests.post(
+                WP_URL, json=payload,
+                headers={"Authorization": f"Bearer {WP_KEY}", "Content-Type": "application/json"},
+                timeout=180, impersonate="chrome")
+            if r.status_code == 200:
+                print(f"   ✅ {r.json()}")
+                return True
+            else:
+                print(f"   ⚠️ Tentative {attempt+1}/3 : HTTP {r.status_code}")
+        except Exception as e:
+            print(f"   ⚠️ Tentative {attempt+1}/3 : {e}")
+        time.sleep(5 * (attempt + 1))
+    return False
+
+
 async def main():
+    # 1. Liste
     list_html = await fetch_list()
     if len(list_html) < 50000:
         print("❌ HTML trop petit"); sys.exit(1)
 
-    vehicles = parse_list(list_html)
-    print(f"\n📦 {len(vehicles)} véhicules")
+    all_vehicles = parse_list(list_html)
+    print(f"\n📦 {len(all_vehicles)} véhicules dans la liste")
 
-    print(f"\n🔍 Détails (max {MAX_DETAILS})...")
-    for i, v in enumerate(vehicles[:MAX_DETAILS], 1):
-        print(f"   [{i}] {v['brand']} {v['detailed_model'][:30]}")
+    if not all_vehicles:
+        sys.exit(0)
+
+    # 2. Détails + filtre véhicules AVEC images
+    print(f"\n🔍 Extraction des détails (filtre : ≥ {MIN_IMAGES} image)...")
+    valid_vehicles = []
+    skipped_no_img = 0
+    skipped_no_detail = 0
+
+    for i, v in enumerate(all_vehicles, 1):
         dh = fetch_detail(v["_url"])
-        if dh:
-            extra = parse_detail(dh)
-            v.update(extra)
-        time.sleep(1)
+        if not dh:
+            print(f"   [{i:02d}] ❌ {v['brand']} {v['detailed_model'][:30]} → détail KO")
+            skipped_no_detail += 1
+            time.sleep(0.3)
+            continue
 
-    print("\n--- Aperçu ---")
-    for v in vehicles[:3]:
-        print(f"  {v.get('brand')} | {v.get('detailed_model')[:30]} | {v.get('price')}€ | {v.get('fuel','N/A')} | {len(v.get('images',[]))} imgs")
+        extra = parse_detail(dh)
+        v.update(extra)
 
-    payload = {"source": "VPauto", "total": len(vehicles), "vehicules": vehicles}
-    print(f"\n📤 Envoi à WordPress ({len(vehicles)})...")
-    r = cffi_requests.post(WP_URL, json=payload,
-        headers={"Authorization": f"Bearer {WP_KEY}", "Content-Type": "application/json"},
-        timeout=120, impersonate="chrome")
-    print(f"✅ {r.json()}" if r.status_code == 200 else f"❌ {r.status_code}: {r.text[:300]}")
+        img_count = len(v.get("images", []))
+        if img_count >= MIN_IMAGES:
+            print(f"   [{i:02d}] ✅ {v['brand']} {v['detailed_model'][:30]} → 🖼️ {img_count}")
+            valid_vehicles.append(v)
+        else:
+            print(f"   [{i:02d}] ⏭️  {v['brand']} {v['detailed_model'][:30]} → pas d'image (skip)")
+            skipped_no_img += 1
+
+        time.sleep(0.4)
+
+    # 3. Résumé
+    print(f"\n{'='*60}")
+    print(f"📊 Résumé :")
+    print(f"   Total liste       : {len(all_vehicles)}")
+    print(f"   ✅ Valides        : {len(valid_vehicles)} (avec images)")
+    print(f"   ⏭️  Sans image     : {skipped_no_img}")
+    print(f"   ❌ Détail KO       : {skipped_no_detail}")
+    print(f"{'='*60}")
+
+    if not valid_vehicles:
+        print("\n⚠️ Aucun véhicule avec images, arrêt.")
+        sys.exit(0)
+
+    # 4. Aperçu
+    print(f"\n--- Aperçu 3 premiers ---")
+    for v in valid_vehicles[:3]:
+        print(f"   {v['brand']:<12} | {v['detailed_model'][:35]:<35} | {v['price']:>7}€ | {len(v['images'])} imgs | {v.get('fuel', 'N/A')}")
+
+    # 5. Envoi par batch
+    total_batches = (len(valid_vehicles) + BATCH_SIZE - 1) // BATCH_SIZE
+    success_count = 0
+
+    for i in range(0, len(valid_vehicles), BATCH_SIZE):
+        batch = valid_vehicles[i:i + BATCH_SIZE]
+        batch_num = (i // BATCH_SIZE) + 1
+        if send_batch(batch, batch_num, total_batches):
+            success_count += len(batch)
+        time.sleep(3)
+
+    print(f"\n🎯 Envoyés : {success_count}/{len(valid_vehicles)}")
+    if success_count == 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
