@@ -13,7 +13,7 @@ WP_URL = os.environ["WP_URL"]
 WP_KEY = os.environ["WP_API_KEY"]
 
 VPAUTO_URL = "https://www.vpauto.fr/vehicule/liste?event=43301"
-MAX_DETAILS = 1
+MAX_DETAILS = 100
 
 
 async def fetch_list():
